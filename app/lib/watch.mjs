@@ -6,46 +6,26 @@
 //   council.json  -> setup        round-1.md -> Round 1 cards   cruxes.json -> fault lines
 //   round-2.md    -> debate cards  draft.json -> proposal       round-3.md  -> votes
 //   verdict.json  -> the verdict
+// A person on this Mac answers in the room's form. Each request waits in inbox/<seat>-r<N>.request.json.
+// The watcher never reads inbox/ as cards. It only reports who is being waited on (waiting, waiting_done)
+// and keeps the session alive while an answer is still due.
 import fs from "node:fs";
 import path from "node:path";
-import { SEATS, byKey, parseCard, checkQuotes, loadRoster, defaultBoard, seatIn } from "./seats.mjs";
+import { SEATS, byKey, parseCard, checkQuotes, loadRoster, defaultBoard, seatKey, splitCards } from "./seats.mjs";
 import { SESSIONS_DIR } from "./env.mjs";
-import { optionScores, finalNumbers, verdictSeats, DISCLAIMER } from "./council.mjs";
+import { optionScores, finalNumbers, verdictSeats } from "./council.mjs";
+import { readRequests } from "./inbox.mjs";
+import { councilDisclaimer } from "../public/runners.js";
 
 const live = new Map(); // folder name -> session
 const STALE_MS = 3 * 60 * 60 * 1000; // a folder untouched this long is an abandoned council
 
 const readText = (p) => { try { return fs.readFileSync(p, "utf8"); } catch { return null; } };
-const readJson = (p) => { const t = readText(p); if (!t) return null; try { return JSON.parse(t); } catch { return null; } };
+const parseJson = (t) => { if (!t) return null; try { return JSON.parse(t); } catch { return null; } };
+const readJson = (p) => parseJson(readText(p));
 
-/** "Gary V", "garyvee", "GARY V (Marketing)", "Warren Buffett" -> seat key */
-export function seatKey(x) {
-  const t = String(x || "").toLowerCase().replace(/\(.*$/, "").replace(/[^a-z ]/g, " ").replace(/\s+/g, " ").trim();
-  if (!t) return null;
-  return SEATS.find((s) => t === s.key || t === s.short.toLowerCase() || t === s.name.toLowerCase())?.key || seatIn(t)?.key || null;
-}
-
-/** Split a round file into seat cards. A card is the text under a "## <Seat>" heading
- * (how the skill writes them); without seat headings, each "SEAT:" line starts a card.
- * Chair sections are dropped. */
-export function splitCards(md) {
-  const heads = [...md.matchAll(/^#{2,3}[ \t]+(.+)$/gm)];
-  const seatHeads = heads.filter((h) => !/chair/i.test(h[1]) && seatKey(h[1]));
-  if (seatHeads.length) {
-    return seatHeads.map((h) => {
-      const next = heads.find((n) => n.index > h.index);
-      const text = md.slice(h.index + h[0].length, next ? next.index : md.length).replace(/(\n\s*(-{3,}|\*{3,}))+\s*$/g, "").trim();
-      return { key: seatKey(h[1]), text };
-    }).filter((c) => c.text);
-  }
-  const body = md.split(/^#{1,4}[^\n]*\bchair\b[^\n]*$/im)[0];
-  const marks = [...body.matchAll(/^\**SEAT\**[ \t]*:[ \t]*(.+)$/gim)];
-  return marks.map((m, i) => {
-    const end = i + 1 < marks.length ? marks[i + 1].index : body.length;
-    const text = body.slice(m.index, end).replace(/(\n\s*(#{1,4} [^\n]*|-{3,}|\*{3,}))+\s*$/g, "").trim();
-    return { key: seatKey(m[1]), text };
-  }).filter((c) => c.key);
-}
+// seatKey and splitCards live in seats.mjs; re-exported so existing importers keep working.
+export { seatKey, splitCards };
 
 function emit(x, type, data = {}) {
   const ev = { type, t: Date.now() - x.started, ...data };
@@ -60,6 +40,33 @@ function finish(x, status) {
   x.subs.clear();
 }
 
+// How a seat runs when council.json does not say. Same words as the runner the API app reports,
+// except that Claude Code runs an Anthropic seat as a subagent, not over HTTP.
+const TRANSPORT = { anthropic: "subagent", openai: "http", google: "http", human: "form" };
+
+/** { [seatKey]: { provider, model, transport } } for the seats at the table. A seat that council.json
+ * lists under `runners` is taken as written (a missing provider comes from the roster, a missing transport
+ * from the provider's usual one). Any other seat runs as its roster entry says. */
+function normalizeRunners(c, seats) {
+  const given = {};
+  if (c.runners && typeof c.runners === "object" && !Array.isArray(c.runners)) {
+    for (const [name, r] of Object.entries(c.runners)) {
+      const k = seatKey(name);
+      if (k && r && typeof r === "object" && !Array.isArray(r)) given[k] = r;
+    }
+  }
+  const out = {};
+  for (const k of seats) {
+    const seat = byKey[k];
+    const r = given[k];
+    const provider = r?.provider ?? seat?.provider ?? "anthropic";
+    out[k] = r
+      ? { provider, model: r.model ?? null, transport: r.transport ?? TRANSPORT[provider] ?? null }
+      : { provider, model: seat?.model ?? null, transport: TRANSPORT[provider] ?? null };
+  }
+  return out;
+}
+
 function normalizeSetup(c) {
   const options = (c.options || []).map((o, i) => (typeof o === "string" ? { id: "ABCD"[i], label: o } : { id: String(o.id || "ABCD"[i]).toUpperCase(), label: o.label || o.text || "" }));
   loadRoster(); // pick up a seat added since the room started
@@ -68,10 +75,11 @@ function normalizeSetup(c) {
   for (const w of wl) { const k = seatKey(w.seat); if (k) weights[k] = { weight: Math.max(1, Math.min(3, Number(w.weight) || 1)), reason: w.reason || "" }; }
   const seats = (c.seats || []).map(seatKey).filter(Boolean);
   const mode = c.mode === "quick" ? "quick" : "full";
+  const table = seats.length ? [...new Set(seats)] : defaultBoard();
   return {
     title: c.title || "Roast Room", decision: c.decision || "", brief: c.brief || "", mode,
     options, assumptions: c.assumptions || [], weights,
-    seats: seats.length ? [...new Set(seats)] : defaultBoard(),
+    seats: table, runners: normalizeRunners(c, table),
   };
 }
 
@@ -93,6 +101,9 @@ function readRound(x, r, force) {
   const st = x.st;
   const md = readText(path.join(x.dir, `round-${r}.md`));
   if (!md) return false;
+  // The room seals this round's cards while a person is being waited on, so say so before the first card.
+  // (A room opened mid-round, or a restart, reads a round file that is already on disk.)
+  checkWaiting(x);
   for (const c of splitCards(md)) {
     if (!st.seats.includes(c.key) || st.cards[r][c.key]) continue;
     const parsed = parseCard(c.text, st.options.map((o) => o.id));
@@ -102,6 +113,12 @@ function readRound(x, r, force) {
   }
   const have = st.seats.filter((k) => st.cards[r][k]).length;
   if (have === st.seats.length || (force && have > 0)) {
+    // The Chair moved on without these seats (a person who missed the deadline, a model that failed).
+    // Say so once, as the API runner does. Scoring already skips a seat that has no card.
+    for (const k of st.seats) if (!st.cards[r][k]) emit(x, "seat_absent", { round: r, seat: k, reason: "no card" });
+    // The room opens the sealed cards at waiting_done or round_done. Send waiting_done first, so it never
+    // arrives after the round it belongs to has closed.
+    if (x.waiting?.round === r) { emit(x, "waiting_done", { round: r }); x.waiting = null; }
     st.scores[r] = optionScores(st, r);
     emit(x, "round_done", { round: r, scores: st.scores[r] });
     return true;
@@ -109,19 +126,21 @@ function readRound(x, r, force) {
   return false;
 }
 
-function sync(x) {
+function advance(x) {
   const f = (n) => path.join(x.dir, n);
   const has = (n) => fs.existsSync(f(n));
   const st = x.st;
 
   if (x.step === "setup") {
-    const c = readJson(f("council.json"));
+    const raw = readText(f("council.json"));
+    const c = parseJson(raw);
     if (!c) return;
     Object.assign(st, normalizeSetup(c));
+    x.councilRaw = raw;
     x.title = st.title;
     x.mode = st.mode;
     emit(x, "phase", { phase: "setup", label: "The Chair is reading your question", at: mtime(f("council.json")) });
-    emit(x, "setup", { title: st.title, decision: st.decision, brief: st.brief, options: st.options, assumptions: st.assumptions, weights: st.weights, seats: st.seats, mode: st.mode });
+    emit(x, "setup", { title: st.title, decision: st.decision, brief: st.brief, options: st.options, assumptions: st.assumptions, weights: st.weights, seats: st.seats, mode: st.mode, runners: st.runners });
     startRound(x, 1, "Round 1: opening positions", mtime(f("council.json")));
     x.step = "r1";
   }
@@ -170,7 +189,8 @@ function sync(x) {
       amendments: v.amendments || [], conditions: v.conditions || [],
       next_steps: (v.next_steps || []).map((n) => (typeof n === "string" ? { when: "", action: n } : n)),
       cheapest_test: v.cheapest_test || "", kill_criteria: v.kill_criteria || "", revisit: v.revisit || "",
-      recommended: v.recommended || recommended, scores: finalScores, spread: spreadF, confidence, support, votes, disclaimer: DISCLAIMER,
+      recommended: v.recommended || recommended, scores: finalScores, spread: spreadF, confidence, support, votes,
+      disclaimer: councilDisclaimer(st.seats.map((k) => byKey[k]).filter(Boolean), st.runners),
     };
     emit(x, "verdict", { verdict, seats: verdictSeats(st, last) });
     x.step = "done";
@@ -178,8 +198,80 @@ function sync(x) {
   }
 }
 
+// A request waits for a person while it says "pending" and its deadline, written as text, is still ahead.
+// A request file is anything a person or a script put there, so a deadline of any other type is not trusted.
+const isPending = (q, now) => q.status === "pending" && typeof q.deadline === "string" && Date.parse(q.deadline) > now;
+
+/** The pending requests for the round the watcher is on: still "pending" and before their deadline,
+ * as [{ key, deadline }] in a fixed order, so two reads of the same files compare equal.
+ * A round that has closed (round_done sent) is not waited on, so a request left "pending" for it is
+ * not announced again after the room has opened its cards. */
+function pendingNow(x, now) {
+  if (!x.round || x.st.scores[x.round]) return [];
+  return readRequests(x.dir)
+    .filter((q) => isPending(q, now) && q.round === x.round && typeof q.seat === "string")
+    .map((q) => ({ key: q.seat, deadline: q.deadline }))
+    .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.deadline < b.deadline ? -1 : a.deadline > b.deadline ? 1 : 0));
+}
+
+/** Does any request in this session, from any round, still wait for a person? */
+const anyPending = (dir, now) => readRequests(dir).some((q) => isPending(q, now));
+
+// Tell the room when the people being waited on change. x.waiting is what the room was last told:
+// { round, seats } or null. `waiting` goes out when the list changes and is not empty. `waiting_done`
+// goes out once when it empties, or when the room moves to another round (that round's requests no
+// longer count). A deadline that passes empties the list on the next scan, with no file change.
+function checkWaiting(x) {
+  const seats = pendingNow(x, Date.now());
+  const told = x.waiting;
+  if (told && (!seats.length || told.round !== x.round)) {
+    emit(x, "waiting_done", { round: told.round });
+    x.waiting = null;
+  }
+  if (seats.length && JSON.stringify(seats) !== JSON.stringify(x.waiting?.seats)) {
+    emit(x, "waiting", { round: x.round, seats });
+    x.waiting = { round: x.round, seats };
+  }
+}
+
+// council.json can change after setup: the Chair updates a transport when a seat falls back. The
+// table stays as set up. A file that does not parse (half written) is read again on the next scan.
+function checkRunners(x) {
+  if (x.step === "setup") return;
+  const raw = readText(path.join(x.dir, "council.json"));
+  if (raw === null || raw === x.councilRaw) return;
+  const c = parseJson(raw);
+  if (!c) return;
+  x.councilRaw = raw;
+  loadRoster();
+  const runners = normalizeRunners(c, x.st.seats);
+  if (JSON.stringify(runners) === JSON.stringify(x.st.runners)) return;
+  x.st.runners = runners;
+  emit(x, "runners", { runners });
+}
+
+function sync(x) {
+  checkRunners(x);
+  advance(x);
+  if (x.status === "running") checkWaiting(x);
+}
+
+// When the session last changed: the newest file in the folder, and in inbox/. A folder's own time
+// is not counted: it also moves when a file is deleted or renamed, which is not progress.
 function lastTouched(dir) {
-  try { return Math.max(...fs.readdirSync(dir).map((n) => fs.statSync(path.join(dir, n)).mtimeMs)); } catch { return 0; }
+  const newest = (d) => {
+    let names;
+    try { names = fs.readdirSync(d); } catch { return 0; } // no such folder (inbox/ is optional)
+    let t = 0;
+    for (const n of names) {
+      try {
+        const st = fs.statSync(path.join(d, n));
+        if (st.isFile()) t = Math.max(t, st.mtimeMs);
+      } catch { /* removed since the listing */ }
+    }
+    return t;
+  };
+  return Math.max(newest(dir), newest(path.join(dir, "inbox")));
 }
 
 function load(name) {
@@ -190,9 +282,16 @@ function load(name) {
       st: { cards: { 1: {}, 2: {}, 3: {} }, scores: {}, rounds: [] } };
     live.set(name, x);
   }
+  // A stopped session was only idle: a file that lands after the stop means the Chair came back (a council
+  // that waited overnight on a person), so pick it up again where it left off.
+  if (x.status === "stopped" && lastTouched(dir) >= x.stoppedAt) x.status = "running";
   if (x.status === "running") {
     sync(x);
-    if (x.status === "running" && Date.now() - lastTouched(dir) > STALE_MS) finish(x, "stopped");
+    // A folder untouched for hours is abandoned, unless a person still has time to answer.
+    if (x.status === "running" && Date.now() - lastTouched(dir) > STALE_MS && !anyPending(dir, Date.now())) {
+      finish(x, "stopped");
+      x.stoppedAt = Date.now();
+    }
   }
   return x;
 }
@@ -204,7 +303,10 @@ function skillFolders() {
 }
 
 export function scan() {
-  for (const name of skillFolders()) load(name);
+  // setInterval calls this with nothing to catch an error, and one unreadable folder must not hide the others.
+  for (const name of skillFolders()) {
+    try { load(name); } catch (e) { console.error(`watch: ${name}: ${e?.message ?? e}`); }
+  }
 }
 
 export function getLive(id) {
@@ -221,7 +323,9 @@ export function listLive() {
   return skillFolders().map((n) => { const x = load(n); return { id: x.id, title: x.title || n, prompt: "", mode: x.mode, status: x.status, source: "claude-code" }; });
 }
 
+/** Scan now and then once a second. Returns a function that stops the scanning. */
 export function startWatching() {
   scan();
-  setInterval(scan, 1000);
+  const timer = setInterval(scan, 1000);
+  return () => clearInterval(timer);
 }

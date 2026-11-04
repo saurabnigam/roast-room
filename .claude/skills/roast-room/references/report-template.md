@@ -51,3 +51,11 @@ Math: [one line per option]
 ---
 Simulated advisors built from each person's public work. They are not the people and do not speak for them.
 ```
+
+**Footer when a person sat on the panel.** Keep that line and add one sentence after it that names every person at the table, by full name, with the `councilDisclaimer` wording the room and the PDF use:
+
+```markdown
+Simulated advisors built from each person's public work. They are not the people and do not speak for them. Real people on this panel, answering live: Priya Rao.
+```
+
+With two people it reads "Priya Rao and Sam Lee". With three or more it reads "A, B, and C". A person's card is their own words, so the "Simulated" line does not cover them: the added sentence does.

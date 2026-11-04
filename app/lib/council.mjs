@@ -1,23 +1,105 @@
 import fs from "node:fs";
 import path from "node:path";
-import { SEATS, BOARD, byKey, systemFor, parseCard, checkQuotes, defaultBoard, loadRoster } from "./seats.mjs";
-import * as ai from "./anthropic.mjs";
-import { S } from "./anthropic.mjs";
-import { SESSIONS_DIR } from "./env.mjs";
+import { SEATS, BOARD, byKey, systemFor, systemText, parseCard, checkQuotes, defaultBoard, loadRoster } from "./seats.mjs";
+import * as ai from "./providers/anthropic.mjs";
+import { S } from "./providers/anthropic.mjs";
+import { complete, hasKey, resolveModel, KEY_ENV, MAX_TOKENS, providerUsage } from "./providers/index.mjs";
+import { ProviderError } from "./providers/http.mjs";
+import { buildUser } from "./seatprompt.mjs";
+import { openApiRequest, dropApiSession, deadlineFrom } from "./inbox.mjs";
+import { DISCLAIMER, councilDisclaimer, recipientsLine, companyName } from "../public/runners.js";
+import { env, SESSIONS_DIR } from "./env.mjs";
+
+// watch.mjs still imports the disclaimer from here. The text itself lives in runners.js.
+export { DISCLAIMER };
 
 export const MODELS = {
-  seat: process.env.SEAT_MODEL || "claude-sonnet-5-5",
-  chair: process.env.CHAIR_MODEL || "claude-opus-5-5",
+  seat: env("SEAT_MODEL") || "claude-sonnet-5-5",
+  chair: env("CHAIR_MODEL") || "claude-opus-5-5",
 };
 
+// One AI seat gets this long for all it does in a round (a retry included). A slower seat is absent.
+export const SEAT_TIMEOUT_MS = 300000;
+let seatTimeoutMs = SEAT_TIMEOUT_MS;
+/** Tests only: shorten the seat time limit. Call with no argument to put the real one back. */
+export function setSeatTimeout(ms) {
+  seatTimeoutMs = Number.isFinite(ms) && ms > 0 ? ms : SEAT_TIMEOUT_MS;
+}
+
+// A round with fewer cards than this stops and asks the user whether to go on. Three, or every
+// seat when the table has fewer than three, so a small board that fully answers is not stopped.
+const quorum = (st) => Math.min(3, st.seats.length);
+
+const isHuman = (key) => byKey[key]?.provider === "human";
+const providerOf = (key) => byKey[key]?.provider ?? "anthropic";
+
 // The board comes from the roster: the saved default board, or every seat it lists.
+const nameList = (xs) => xs.map((x) => `${x.name} (${(x.pillar || "").toLowerCase()})`).join(", ");
 const chairSystem = (st) => {
   const seats = st.board.map((k) => byKey[k]);
-  return `You are the Chair of a Roast Room council: ${seats.length} simulated advisors built from the public work of ${seats.map((x) => `${x.name} (${x.pillar.toLowerCase()})`).join(", ")}.
+  const people = seats.filter((x) => x.provider === "human");
+  const sims = seats.filter((x) => x.provider !== "human");
+  // A person is not a simulation, so the Chair is told which seats are which.
+  const who = !people.length
+    ? `${seats.length} simulated advisors built from the public work of ${nameList(seats)}`
+    : `${sims.length ? `${sims.length} simulated advisors built from the public work of ${nameList(sims)}, and ` : ""}${people.length} real ${people.length === 1 ? "person who answers" : "people who answer"} live: ${nameList(people)}`;
+  return `You are the Chair of a Roast Room council: ${who}.
 You never argue a side and never add your own pillar. You run the room, keep score, and write in plain English: short sentences, no em dashes, no hype, no tee-ups like "here's the thing", no filler. Seat keys (for key fields only): ${seats.map((x) => x.key).join(", ")}. Whenever you write a seat's name in prose or in a seat field, use its display name: ${seats.map((x) => x.short).join(", ")}.`;
 };
 
-export const DISCLAIMER = "Simulated advisors built from each person's public work. They are not the people and do not speak for them.";
+// ---------------------------------------------------------------- keys, seats and runners
+/**
+ * The API keys this council needs and does not have, before any call is made:
+ * [{ seat, provider, env }] for each AI seat whose provider key is unset, in the order given, then
+ * the Chair (seat "chair", which always runs on Anthropic) when ANTHROPIC_API_KEY is unset.
+ * A person needs no key. A key that is not a seat on the roster is skipped.
+ */
+export function missingKeys(seatKeys = []) {
+  loadRoster();
+  const out = [];
+  for (const k of seatKeys) {
+    const seat = byKey[k];
+    if (!seat || seat.provider === "human") continue;
+    const provider = providerOf(k);
+    if (!hasKey(provider)) out.push({ seat: k, provider, env: KEY_ENV[provider] });
+  }
+  if (!hasKey("anthropic")) out.push({ seat: "chair", provider: "anthropic", env: KEY_ENV.anthropic });
+  return out;
+}
+
+/** One plain sentence per missing key, for the room: "Buffett runs on OpenAI but OPENAI_API_KEY is not set." */
+export function missingKeysMessage(missing) {
+  return missing
+    .map((m) => (m.seat === "chair"
+      ? `The Chair runs on Anthropic but ${m.env} is not set.`
+      : `${byKey[m.seat].short} runs on ${companyName(m.provider)} but ${m.env} is not set.`))
+    .join(" ");
+}
+
+/** The seats the Chair may pick from: not a person, and on Anthropic or with a key set. */
+export function pickableSeats() {
+  loadRoster();
+  return SEATS.filter((x) => x.provider !== "human" && (x.provider === "anthropic" || hasKey(x.provider))).map((x) => x.key);
+}
+
+/**
+ * How each seat will run in this app: { [key]: { provider, model, transport } }. An AI seat is
+ * called over "http" with the model from resolveModel (the seat's own, else the env default, else
+ * the built-in one). A person answers in a "form" and has no model. A key not on the roster is left out.
+ */
+export function runnersFor(seatKeys = []) {
+  loadRoster();
+  const out = {};
+  for (const k of seatKeys) {
+    const seat = byKey[k];
+    if (!seat) continue;
+    const provider = providerOf(k);
+    out[k] = provider === "human"
+      ? { provider, model: null, transport: "form" }
+      : { provider, model: resolveModel(provider, { seatModel: seat.model }), transport: "http" };
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------- sessions
 const sessions = new Map();
@@ -48,6 +130,37 @@ export function subscribe(s, res) {
   s.subs.add(res);
   res.on("close", () => s.subs.delete(res));
 }
+
+// ---------------------------------------------------------------- pauses
+// The runner stops at two points and waits for the user: before Round 1 when anyone outside Anthropic
+// would see the brief ("privacy"), and after a round that came back with too few cards ("quorum").
+// resume() is how the room answers. One pause is open at a time, so the session id is the key.
+const pauses = new Map(); // session id -> { s, kind, answer }
+
+/** Emit a pause and wait. Resolves "continue" or "stop" when resume() is called. */
+function pauseFor(s, kind, data = {}) {
+  return new Promise((answer) => {
+    pauses.set(s.id, { s, kind, answer });
+    emit(s, "pause", { kind, ...data });
+  });
+}
+
+/**
+ * Answer the pause that is open for this council. action is "continue" or "stop". Returns true when
+ * a pause was waiting and took the answer, false when none was open or the action is not one of those
+ * two (the pause then stays open).
+ */
+export function resume(id, action) {
+  const p = pauses.get(id);
+  if (!p || (action !== "continue" && action !== "stop")) return false;
+  pauses.delete(id);
+  emit(p.s, "resumed", { kind: p.kind, action });
+  p.answer(action);
+  return true;
+}
+
+/** A council that ends on purpose, not on a fault: the user chose to stop. */
+class Stopped extends Error {}
 
 // ---------------------------------------------------------------- prompts
 function briefBlock(st) {
@@ -94,8 +207,10 @@ function cardsBlock(st, round) {
   return st.seats.map((k) => `### ${byKey[k].short} (weight ${st.weights[k].weight})\n${st.cards[round][k]?.text || "(no card)"}`).join("\n\n");
 }
 
+const cruxLines = (st) => st.cruxes.map((c, i) => `${i + 1}. ${c.question} (${c.sides.map((x) => `${x.position}: ${x.seats.map((k) => byKey[k]?.short || k).join(", ")}`).join("; ")})`).join("\n");
+
 function round2Prompt(st, seat) {
-  const cr = st.cruxes.map((c, i) => `${i + 1}. ${c.question} (${c.sides.map((x) => `${x.position}: ${x.seats.map((k) => byKey[k]?.short || k).join(", ")}`).join("; ")})`).join("\n");
+  const cr = cruxLines(st);
   const push = st.pressure?.[seat.key] ? `\nFor you specifically: ${st.pressure[seat.key]}\n` : "";
   return `ROAST ROOM COUNCIL, ROUND 2 OF 3: DEBATE
 
@@ -127,8 +242,15 @@ MY CONDITIONS FOR YES: up to three, concrete and checkable (a number, a date, a 
 Rules: engage the actual arguments on the table. Move only for a better argument, never to be agreeable. If everyone agrees with you, attack the weakest part of your own case.`;
 }
 
+const draftBlock = (d) => `Recommendation: ${d.label} on option ${d.option}. ${d.recommendation}
+Conditions:
+${d.conditions.map((c) => `- ${c}`).join("\n")}
+Next steps:
+${d.next_steps.map((c) => `- ${c}`).join("\n")}
+Cheapest test: ${d.cheapest_test}
+Kill criteria: ${d.kill_criteria}`;
+
 function round3Prompt(st, seat) {
-  const d = st.draft;
   return `ROAST ROOM COUNCIL, ROUND 3 OF 3: VOTE ON THE DRAFT RESOLUTION
 
 You hold the ${seat.short.toUpperCase()} seat.
@@ -137,16 +259,10 @@ THE BRIEF
 ${briefBlock(st)}
 
 YOUR ROUND 2 CARD
-${st.cards[2][seat.key]?.text || ""}
+${st.cards[2][seat.key]?.text || "(none: you did not answer Round 2)"}
 
 THE CHAIR'S DRAFT RESOLUTION
-Recommendation: ${d.label} on option ${d.option}. ${d.recommendation}
-Conditions:
-${d.conditions.map((c) => `- ${c}`).join("\n")}
-Next steps:
-${d.next_steps.map((c) => `- ${c}`).join("\n")}
-Cheapest test: ${d.cheapest_test}
-Kill criteria: ${d.kill_criteria}
+${draftBlock(st.draft)}
 
 Answer in your seat's voice, first person, under 140 words, in exactly this shape:
 
@@ -301,52 +417,164 @@ Write the verdict for the founder.
 }
 
 // ---------------------------------------------------------------- the run
-async function runSeat(s, st, round, key, prompt) {
-  const seat = byKey[key];
-  emit(s, "seat_start", { round, seat: key });
-  let text = "";
-  try {
-    text = await ai.stream({
-      model: MODELS.seat, system: systemFor(key), maxTokens: 1400,
-      messages: [{ role: "user", content: prompt }],
-      onText: (d) => { text += d; emit(s, "delta", { round, seat: key, text: d }); },
-    });
-  } catch (e) {
-    emit(s, "seat_error", { round, seat: key, error: String(e.message || e) });
-    throw e;
+// What a person sees above the form. It holds the same task the AI seats get, without the card
+// template: the form already has the fields.
+function humanPrompt(st, round, seat) {
+  const w = st.weights[seat.key];
+  const title = ["OPENING POSITION", "DEBATE", "VOTE ON THE DRAFT RESOLUTION"][round - 1];
+  const push = round === 2 && st.pressure?.[seat.key] ? `\n\nFor you specifically: ${st.pressure[seat.key]}` : "";
+  const ask = [
+    "Give your own view. Argue from your pillar first. Use real numbers when the brief has them, and say which numbers you are assuming.",
+    "Answer the arguments on the table. Move only for a better argument, never to be agreeable.",
+    "Vote on the draft resolution. Give an amendment only if you need one.",
+  ][round - 1];
+  return `ROAST ROOM COUNCIL, ROUND ${round} OF 3: ${title}\n\nYou hold the ${seat.short.toUpperCase()} seat (${seat.pillar}). Your weight on this decision: ${w.weight}/3${w.reason ? ` (${w.reason})` : ""}.\n\n${ask}${push}`;
+}
+
+// The session files a person may read, by the same names the Claude Code path uses (spec section 5):
+// Round 1 the brief; Round 2 also every Round 1 card and the cruxes; Round 3 the brief, their own
+// Round 2 card (when they gave one) and the draft. Nobody sees another seat's card before their own.
+function humanContext(st, round, key) {
+  const items = [{ name: "brief.md", text: briefBlock(st) }];
+  if (round === 2) items.push({ name: "round-1.md", text: cardsBlock(st, 1) }, { name: "cruxes.json", text: cruxLines(st) });
+  if (round === 3) {
+    const own = st.cards[2][key]?.text;
+    if (own) items.push({ name: "Your Round 2 card", text: own });
+    items.push({ name: "draft-resolution.md", text: draftBlock(st.draft) });
   }
-  const parsed = parseCard(text, st.options.map((o) => o.id));
-  const quotes = checkQuotes(key, text);
-  st.cards[round][key] = { text, parsed, quotes };
-  emit(s, "seat_done", { round, seat: key, text, parsed, quotes, name: seat.name });
+  return items;
+}
+
+const stagger = (i) => new Promise((r) => setTimeout(r, i * 350));
+
+// Why a seat has no card, in words for the room. `signal` is the seat's time limit.
+function failureReason(e, { human, signal }) {
+  if (human && e?.message === "deadline") return "no answer by the deadline";
+  if (signal?.aborted) return `timed out after ${Math.round(seatTimeoutMs / 1000)} seconds`;
+  return String(e?.message || e);
+}
+
+/** An OpenAI or Google seat: one call, retried once on an error. A timeout is not retried, and neither
+ * is a ProviderError that says it is not retryable (a bad key, no quota, a refused request): the
+ * second call would fail the same way. */
+async function completeCard(provider, model, key, prompt, signal) {
+  const args = { model, system: systemText(key), user: buildUser({ promptText: prompt, context: [], cardOnly: true }), signal };
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const r = await complete(provider, args);
+      return { text: r.text, partial: r.stopReason === "max_tokens" };
+    } catch (e) {
+      if (attempt === 1 || signal.aborted || (e instanceof ProviderError && e.retryable === false)) throw e;
+    }
+  }
+}
+
+async function runSeat(s, st, round, key, ask, promptFn) {
+  const seat = byKey[key];
+  const { provider, model } = st.runners[key];
+  const human = provider === "human";
+  emit(s, "seat_start", { round, seat: key });
+  const signal = human ? undefined : AbortSignal.timeout(seatTimeoutMs);
+  let text = "";
+  let partial = false;
+  let card;
+  try {
+    if (human) {
+      text = await ask;
+    } else if (provider === "anthropic") {
+      text = await ai.stream({
+        model, system: systemFor(key), maxTokens: MAX_TOKENS.anthropic, signal,
+        messages: [{ role: "user", content: promptFn(st, seat) }],
+        onText: (d) => { emit(s, "delta", { round, seat: key, text: d }); },
+        onStop: (reason) => { partial = reason === "max_tokens"; },
+      });
+      if (!text.trim()) throw new Error("empty reply");
+    } else {
+      ({ text, partial } = await completeCard(provider, model, key, promptFn(st, seat), signal));
+    }
+    // Reading the card can fail too (an unreadable brain file, say). That is a seat failure like any other.
+    card = { text, parsed: parseCard(text, st.options.map((o) => o.id)), quotes: checkQuotes(key, text) };
+  } catch (e) {
+    const reason = failureReason(e, { human, signal });
+    // A person who ran out of time did not fail. A seat that errored did, and the room shows a toast.
+    if (!human) emit(s, "seat_error", { round, seat: key, error: reason });
+    st.absent[round][key] = reason;
+    emit(s, "seat_absent", { round, seat: key, reason });
+    throw new Error(reason);
+  }
+  st.cards[round][key] = card;
+  emit(s, "seat_done", { round, seat: key, text, parsed: card.parsed, quotes: card.quotes, name: seat.name, partial });
 }
 
 async function roundAll(s, st, round, promptFn) {
   emit(s, "round_start", { round });
+  // A person is asked first, so the room can show the form while the AI seats work.
+  const humans = st.seats.filter((k) => st.runners[k].provider === "human");
+  const asks = new Map();
+  if (humans.length) {
+    const deadline = deadlineFrom();
+    for (const k of humans) {
+      const ask = openApiRequest(s.id, { seat: k, round, prompt: humanPrompt(st, round, byKey[k]), options: st.options, context: humanContext(st, round, k) });
+      ask.catch(() => {}); // runSeat reports a failure; this stops an early deadline looking unhandled
+      asks.set(k, ask);
+    }
+    emit(s, "waiting", { round, seats: humans.map((key) => ({ key, deadline })) });
+  }
   // stagger starts slightly so speech bubbles open in a ripple around the table
-  await Promise.all(st.seats.map((k, i) => new Promise((r) => setTimeout(r, i * 350)).then(() => runSeat(s, st, round, k, promptFn(st, byKey[k])))));
+  const tasks = st.seats.map((k, i) => stagger(i).then(() => runSeat(s, st, round, k, asks.get(k), promptFn)));
+  const waitingDone = humans.length
+    ? Promise.allSettled(tasks.filter((_, i) => asks.has(st.seats[i]))).then(() => emit(s, "waiting_done", { round }))
+    : null;
+  const settled = await Promise.allSettled(tasks); // a seat that fails is already reported as absent
+  // Backstop: a task can also fail outside runSeat's own try (for example while announcing the seat).
+  // Such a seat has no card and no absent entry yet, and the room must still hear that it is absent.
+  settled.forEach((r, i) => {
+    const k = st.seats[i];
+    if (r.status !== "rejected" || st.cards[round][k] || st.absent[round][k]) return;
+    const reason = String(r.reason?.message || r.reason);
+    st.absent[round][k] = reason;
+    emit(s, "seat_absent", { round, seat: k, reason });
+  });
+  await waitingDone;
+
   const scores = optionScores(st, round);
   st.scores[round] = scores;
   emit(s, "round_done", { round, scores });
+
+  const have = st.seats.filter((k) => st.cards[round][k]).length;
+  if (have < quorum(st)) {
+    const action = await pauseFor(s, "quorum", { round, have });
+    if (action === "stop") throw new Stopped(`Stopped after Round ${round}: only ${have} seats answered.`);
+  }
+}
+
+/** The council is over, for any reason: free its inbox requests, close the streams, save it. */
+function closeCouncil(s) {
+  dropApiSession(s.id);
+  pauses.delete(s.id);
+  for (const res of s.subs) res.write(`data: ${JSON.stringify({ type: "end" })}\n\n`);
+  save(s);
 }
 
 export function startCouncil(prompt, mode = "full") {
   const s = newSession(prompt, mode);
   run(s).catch((e) => {
-    s.status = "error";
+    s.status = e instanceof Stopped ? "stopped" : "error";
     emit(s, "error", { error: String(e.message || e) });
-    for (const res of s.subs) res.write(`data: ${JSON.stringify({ type: "end" })}\n\n`);
-    save(s);
+    closeCouncil(s);
   });
   return s;
 }
 
 async function run(s) {
-  // "default" seats the saved default board; "ask" and "auto" let the Chair pick from every seat
-  // (there is no one to ask in the room, so "ask" picks like "auto" here)
+  // "default" seats the saved default board; "ask" and "auto" let the Chair pick from the seats that
+  // can run (there is no one to ask in the room, so "ask" picks like "auto" here). A person sits only
+  // on the default board, and a seat with no API key is never offered.
   loadRoster();
   const pick = BOARD.mode !== "default";
-  const st = (s.state = { prompt: s.prompt, mode: s.mode, pick, board: pick ? SEATS.map((x) => x.key) : defaultBoard(), cards: { 1: {}, 2: {}, 3: {} }, scores: {}, rounds: [] });
+  const board = pick ? pickableSeats() : defaultBoard();
+  if (!board.length) throw new Error("No seats can run: the board is empty.");
+  const st = (s.state = { prompt: s.prompt, mode: s.mode, pick, board, cards: { 1: {}, 2: {}, 3: {} }, scores: {}, rounds: [], absent: { 1: {}, 2: {}, 3: {} } });
   emit(s, "phase", { phase: "setup", label: "The Chair is reading your question" });
   const setup = await chairSetup(st);
   Object.assign(st, {
@@ -362,7 +590,18 @@ async function run(s) {
     for (const k of full) if (st.seats.length < 4 && !st.seats.includes(k)) st.seats.push(k);
   }
   st.board = st.seats.slice(); // later Chair calls only see the seats at the table
-  emit(s, "setup", { title: st.title, decision: st.decision, brief: st.brief, options: st.options, assumptions: st.assumptions, weights: st.weights, seats: st.seats, mode: s.mode });
+  st.runners = runnersFor(st.seats);
+  emit(s, "setup", { title: st.title, decision: st.decision, brief: st.brief, options: st.options, assumptions: st.assumptions, weights: st.weights, seats: st.seats, mode: s.mode, runners: st.runners });
+
+  // A seat with no key cannot run. Say so now, before the privacy pause and before any seat call.
+  const missing = missingKeys(st.seats);
+  if (missing.length) throw new Error(missingKeysMessage(missing));
+
+  // Before anyone outside Anthropic sees the brief, the user confirms who will.
+  if (st.seats.some((k) => st.runners[k].provider !== "anthropic")) {
+    const recipients = recipientsLine(st.seats.map((k) => byKey[k]), st.runners);
+    if (await pauseFor(s, "privacy", { recipients }) === "stop") throw new Stopped("Stopped before Round 1. Nothing was sent outside Anthropic.");
+  }
 
   emit(s, "phase", { phase: "round1", label: "Round 1: opening positions" });
   st.rounds.push(1);
@@ -400,12 +639,12 @@ async function run(s) {
 
   emit(s, "phase", { phase: "verdict", label: "The Chair is writing the verdict" });
   const v = await chairVerdict(st, finalScores, recommended);
-  st.verdict = { ...v, recommended, scores: finalScores, spread: spreadF, confidence, support, votes, disclaimer: DISCLAIMER };
+  const disclaimer = councilDisclaimer(st.seats.map((k) => byKey[k]), st.runners);
+  st.verdict = { ...v, recommended, scores: finalScores, spread: spreadF, confidence, support, votes, disclaimer };
   emit(s, "verdict", { verdict: st.verdict, seats: verdictSeats(st, last) });
   s.status = "done";
-  emit(s, "usage", { usage: ai.usage });
-  for (const res of s.subs) res.write(`data: ${JSON.stringify({ type: "end" })}\n\n`);
-  save(s);
+  emit(s, "usage", { usage: { ...ai.usage, providers: structuredClone(providerUsage) } });
+  closeCouncil(s);
 }
 
 /** The verdict's numbers, computed from the last round's cards (shared with the folder watcher). */
@@ -414,7 +653,9 @@ export function finalNumbers(st) {
   const finalScores = st.scores[last] || optionScores(st, last);
   const recommended = Object.entries(finalScores).sort((a, b) => (b[1].score ?? 0) - (a[1].score ?? 0))[0][0];
   const fv = st.seats.map((k) => st.cards[last][k]?.parsed.optionScores[recommended]).filter((v) => typeof v === "number");
-  const confs = st.seats.map((k) => st.cards[2][k]?.parsed.confidence ?? st.cards[1][k]?.parsed.confidence).filter((v) => typeof v === "number");
+  // A seat with no Round 2 card is out of the average. Round 1 stands in only for a Round 2 card
+  // that gave no confidence of its own.
+  const confs = st.seats.map((k) => (st.cards[2][k] ? st.cards[2][k].parsed.confidence ?? st.cards[1][k]?.parsed.confidence : undefined)).filter((v) => typeof v === "number");
   const spreadF = fv.length ? Math.max(...fv) - Math.min(...fv) : 0;
   const confidence = confs.length ? Math.max(1, Math.min(10, Math.round((confs.reduce((a, b) => a + b, 0) / confs.length) * 2) - (spreadF >= 5 ? 1 : 0))) : null;
   const support = last === 3 ? (() => {
@@ -422,19 +663,25 @@ export function finalNumbers(st) {
     for (const k of st.seats) { const v = st.cards[3][k]?.parsed.finalScore; if (typeof v === "number") { n += v * st.weights[k].weight; d += st.weights[k].weight; } }
     return d ? Math.round((n / d) * 10) / 10 : null;
   })() : null;
-  const votes = last === 3 ? st.seats.reduce((acc, k) => { const v = st.cards[3][k]?.parsed.vote || "endorse"; acc[v] = (acc[v] || 0) + 1; return acc; }, {}) : null;
+  // Only a seat with a Round 3 card and a vote it actually cast is counted. An absent seat has no vote.
+  const votes = last === 3 ? st.seats.reduce((acc, k) => { const v = st.cards[3][k]?.parsed.vote; if (v) acc[v] = (acc[v] || 0) + 1; return acc; }, {}) : null;
   return { last, finalScores, recommended, spreadF, confidence, support, votes };
 }
 
 export function verdictSeats(st, last) {
-  return st.seats.map((k) => ({
-    key: k, weight: st.weights[k].weight,
-    stance: st.cards[last][k]?.parsed.vote || st.cards[2][k]?.parsed.stance,
-    optionScores: st.cards[last][k]?.parsed.optionScores,
-    pillar: st.cards[last][k]?.parsed.pillar ?? st.cards[2][k]?.parsed.pillar,
-    moved: st.cards[2][k]?.parsed.moved,
-    oneLine: st.cards[3][k]?.parsed.oneLine || st.cards[2][k]?.parsed.stance,
-  }));
+  return st.seats.map((k) => {
+    const absent = !st.cards[last][k];
+    // A seat with no card in the last round has no vote, no scores and no line. These stay null, so
+    // the room cannot show an earlier round's stance as if it were this round's answer.
+    return {
+      key: k, weight: st.weights[k].weight, absent,
+      stance: absent ? null : st.cards[last][k].parsed.vote || st.cards[2][k]?.parsed.stance,
+      optionScores: absent ? null : st.cards[last][k].parsed.optionScores,
+      pillar: absent ? null : st.cards[last][k].parsed.pillar ?? st.cards[2][k]?.parsed.pillar,
+      moved: st.cards[2][k]?.parsed.moved,
+      oneLine: absent ? null : st.cards[3][k]?.parsed.oneLine || st.cards[2][k]?.parsed.stance,
+    };
+  });
 }
 
 // ---------------------------------------------------------------- persistence
@@ -449,7 +696,7 @@ export function save(s) {
       fs.writeFileSync(path.join(dir, "brief.md"), lines.join("\n") + "\n");
     }
     for (const r of st.rounds || []) {
-      const body = (st.seats || []).map((k) => `## ${byKey[k].name} (weight ${st.weights[k].weight})\n\n${st.cards[r][k]?.text || ""}`).join("\n\n");
+      const body = (st.seats || []).map((k) => `## ${byKey[k].name} (weight ${st.weights[k].weight})\n\n${st.cards[r][k]?.text || `(absent: ${st.absent?.[r]?.[k] || "no card"})`}`).join("\n\n");
       fs.writeFileSync(path.join(dir, `round-${r}.md`), `# Round ${r}\n\n${body}\n`);
     }
     if (st.verdict) fs.writeFileSync(path.join(dir, "verdict.md"), verdictMarkdown(st));
@@ -474,7 +721,7 @@ function verdictMarkdown(st) {
   if (v.amendments?.length) L.push("", "## Amendments", "", ...v.amendments.map((a) => `- ${a.seat}: ${a.amendment} ${a.adopted ? "Adopted" : "Not adopted"}: ${a.reason}`));
   L.push("", "## Conditions", "", ...v.conditions.map((c, i) => `${i + 1}. ${c}`));
   L.push("", "## What to do next", "", ...v.next_steps.map((n) => `- **${n.when}:** ${n.action}`));
-  L.push("", `**Cheapest test:** ${v.cheapest_test}`, `**Kill criteria:** ${v.kill_criteria}`, `**Revisit:** ${v.revisit}`, "", "---", DISCLAIMER, "");
+  L.push("", `**Cheapest test:** ${v.cheapest_test}`, `**Kill criteria:** ${v.kill_criteria}`, `**Revisit:** ${v.revisit}`, "", "---", v.disclaimer, "");
   return L.join("\n");
 }
 

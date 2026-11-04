@@ -140,13 +140,32 @@ You can build an advisor from public figures, living or historical, with a real 
 
 YouTube transcripts and photos work best with [yt-dlp](https://github.com/yt-dlp/yt-dlp) installed, and PDFs need `pdftotext` ([Poppler](https://poppler.freedesktop.org)). Both are optional: without them, Claude falls back to YouTube's own captions and reads PDFs itself.
 
+## Mixed panel: other models and real people
+
+By default every seat is Claude. Seven seats on one model share one set of blind spots, so any seat can run somewhere else, and a real person can take a seat. The card format does not change, so scoring, the verdict, and the PDF work the same.
+
+| Provider | Who writes the card | What it needs |
+|---|---|---|
+| `anthropic` (default) | A Claude sub-agent on your session's model. A seat can be pinned to one Claude model | Your Claude plan |
+| `openai` | The same advisor on a GPT model (default `gpt-6.1-sol`) | `OPENAI_API_KEY`, or the Codex CLI (below) |
+| `google` | The same advisor on Gemini (default `gemini-3.8-flash`) | `GEMINI_API_KEY`, or the agy CLI (below) |
+| `human` | A real person on this Mac | Nothing. They answer a form in the room |
+
+Seats on OpenAI or Google are billed by that provider. To set this up, copy `.env.example` to `.env` and add the keys you have. Then type `/roast-room board` and say what you want: "run Buffett on openai", "run Naval on google gemini-3.8-flash", or "add a person". When the Chair asks which board to seat, you can also pick **Mixed board**, which moves a few seats to OpenAI or Google for that council only. The Chair never changes a seat's provider on its own, and never seats a person unless you name them or they are on your default board.
+
+**The CLI fallback.** With no API key, an OpenAI seat runs through the `codex` command and a Google seat through `agy`, by way of `delegate.py`. Set `DELEGATE_PY` in `.env` to the absolute path of `delegate.py`. This works only when Claude Code runs the council; the room's own runner needs the keys. The CLI runs isolated, with no access to your repo. Log in to `codex` and `agy` with their own login. Before they start, every environment variable that looks like a secret is removed (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*CREDENTIALS`), so a login that rests on one, such as `GOOGLE_APPLICATION_CREDENTIALS`, does not reach them. With neither a key nor `DELEGATE_PY`, the Chair says so before Round 1 and offers to switch that seat to Claude.
+
+**People on this Mac.** A person has a name, a pillar, and the question they own, and no brain. In each round the room shows them a "Your turn" form with the session files that round allows (in Round 1, only the brief). While they answer, the room keeps the other seats' cards for that round sealed. The seal is in the room's display only: the files in `sessions/` are not hidden. The Chair waits up to 30 minutes a round (`HUMAN_DEADLINE_MIN`). A person who misses the deadline is absent for that round and can answer in the next one. Only people at this Mac can answer, because the room listens on 127.0.0.1 only. If you close the room, the form comes back when you reopen it. The verdict and the PDF name any real people on the panel.
+
+**The privacy step.** Before Round 1, if any seat is on OpenAI or Google, or is a person, the Chair lists who will receive the brief and the later round files, for example "OpenAI (Buffett, via API), Google (Naval, via agy CLI), and Priya on this screen". It asks once: **Send**, or **Use Claude for those seats**. An API call sends only the assembled prompt: the advisor's file and brain, the round prompt, and the round files that seat may see. Keys stay in your environment or `.env` and never go into session files. When the room runs a council itself, it pauses for the same confirmation and waits for your click.
+
 ## Watch an example first
 
 Run `npm start`, open http://localhost:4730, and click **Past sessions**. Three finished councils ship with the repo, so you can see how it works (and download their PDFs) before you run your own.
 
 ## How it works
 
-- **The council runs in Claude Code.** Each seat is a sub-agent (`.claude/agents/council-*.md`, listed in `roster.json`) that reads its own brain (`.claude/skills/roast-room/brains/<name>/`): frameworks, principles, positions, stories, and voice notes compiled from public sources, with every quote tied to a source. Claude Code acts as the Chair. It runs the rounds, keeps score, and writes the verdict (`.claude/skills/roast-room/SKILL.md`).
+- **The council runs in Claude Code.** Each seat is by default a sub-agent (`.claude/agents/council-*.md`, listed in `roster.json`; see "Mixed panel" for other providers and people) that reads its own brain (`.claude/skills/roast-room/brains/<name>/`): frameworks, principles, positions, stories, and voice notes compiled from public sources, with every quote tied to a source. Claude Code acts as the Chair. It runs the rounds, keeps score, and writes the verdict (`.claude/skills/roast-room/SKILL.md`).
 - **Each seat scores every option**, weighted by how much that seat's pillar matters to your decision. The Chair caps the verdict when a seat flags ruin risk, and it forces a real argument when everyone agrees too fast.
 - **The room only watches.** As the Chair works, it writes each step to `sessions/`, and the app plays those files back. Between rounds it shows which round is running, how long it has been, and what each advisor is weighing. The room makes no AI calls of its own.
 - **Every council is saved** in `sessions/`. Past sessions replays any of them and downloads its PDF.
@@ -154,13 +173,13 @@ Run `npm start`, open http://localhost:4730, and click **Past sessions**. Three 
 
 ## Optional: let the room run councils itself
 
-If you'd rather type a decision straight into the room, copy `.env.example` to `.env`, add an `ANTHROPIC_API_KEY`, set `COUNCIL_RUNNER=api`, and restart `npm start`. That mode bills your Anthropic API account (about 25 calls per full council).
+If you'd rather type a decision straight into the room, copy `.env.example` to `.env`, add an `ANTHROPIC_API_KEY`, set `COUNCIL_RUNNER=api`, and restart `npm start`. That mode bills your Anthropic API account (about 25 calls per full council). Seats on OpenAI or Google run in this mode too when their keys are set, and a seat whose key is missing is refused before any call.
 
 ## What's inside
 
 | Path | What |
 |---|---|
-| `.claude/skills/roast-room/` | The council skill: protocol, prompts, scoring, report template, and one brain per advisor |
+| `.claude/skills/roast-room/` | The council skill: protocol, prompts, scoring, report template, one brain per advisor, and the scripts that run seats on other providers and wait for people |
 | `.claude/skills/roast-room/roster.json` | Every advisor, your default board, and how the board is picked |
 | `.claude/skills/newroaster/` | The `/newroaster` skill and its scripts: fetch sources, check quotes, register a seat |
 | `.claude/agents/` | One agent per advisor (`council-<name>.md`) |
