@@ -480,6 +480,18 @@ test("a fresh file in inbox/ keeps an old session running", () => {
   assert.equal(live(name).status, "running");
 });
 
+test("a stopped session comes back when a new file lands", () => {
+  // Found in the first live council: a person missed Round 2, the Chair went on the next day, and the room
+  // had stopped the session overnight, so it never showed Rounds 2 and 3 or the verdict.
+  const name = nextName("stale-revive");
+  const dir = makeSession(repo.root, name, { "council.json": council(["bezos", "graham"]) });
+  age(dir, 4);
+  assert.equal(live(name).status, "stopped");
+  fs.writeFileSync(path.join(dir, "round-1.md"), round(card1, ["Bezos", "Graham"]));
+  assert.equal(live(name).status, "running");
+  assert.equal(events(name, "seat_done").length, 2);
+});
+
 test("an old session is stopped even when its folders have fresh timestamps", () => {
   const name = nextName("stale-folders");
   const dir = makeSession(repo.root, name, { "council.json": council(["bezos", "priya"]) });

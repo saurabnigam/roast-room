@@ -282,10 +282,16 @@ function load(name) {
       st: { cards: { 1: {}, 2: {}, 3: {} }, scores: {}, rounds: [] } };
     live.set(name, x);
   }
+  // A stopped session was only idle: a file that lands after the stop means the Chair came back (a council
+  // that waited overnight on a person), so pick it up again where it left off.
+  if (x.status === "stopped" && lastTouched(dir) >= x.stoppedAt) x.status = "running";
   if (x.status === "running") {
     sync(x);
     // A folder untouched for hours is abandoned, unless a person still has time to answer.
-    if (x.status === "running" && Date.now() - lastTouched(dir) > STALE_MS && !anyPending(dir, Date.now())) finish(x, "stopped");
+    if (x.status === "running" && Date.now() - lastTouched(dir) > STALE_MS && !anyPending(dir, Date.now())) {
+      finish(x, "stopped");
+      x.stoppedAt = Date.now();
+    }
   }
   return x;
 }

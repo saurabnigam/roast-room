@@ -148,6 +148,12 @@ test("parseCard reads bold and heading-wrapped fields", () => {
   assert.equal(p.call, "Do B first.");
 });
 
+test("parseCard reads option ids written in brackets, as the round template shows them", () => {
+  // Found in the first live council: every seat copied "[A] 2/10" from the template, and no score was read.
+  const p = parseCard("SEAT: BUFFETT\nOPTION SCORES: [A] 2/10 · [B] 9/10 · (C) 4/10 · D 5/10\nCONFIDENCE: 4/5", ["A", "B", "C", "D"]);
+  assert.deepEqual(p.optionScores, { A: 2, B: 9, C: 4, D: 5 });
+});
+
 test("parseCard on today's plain format is unchanged", () => {
   assert.deepEqual(parseCard(PLAIN, ["A", "B", "C"]), PLAIN_EXPECTED);
   assert.equal(normalizeCard(PLAIN), PLAIN, "a plain card passes through normalizeCard untouched");

@@ -217,12 +217,13 @@ export function parseOptionScores(text, optionIds) {
   // The label counts at a line start or after a "·" or "|" (like every other field, see field()), so a
   // sentence that merely says "option scores: ..." cannot win. normalizeCard has already turned
   // "**OPTION SCORES:**" and "## OPTION SCORES" plus a value line into a plain line-start label.
-  // The option line itself uses "·" between options, so read to end of line.
+  // The option line itself uses "·" between options, so read to end of line. An id may be wrapped as
+  // "[A]" or "(A)", because the round template shows "[A] n/10" and a seat can copy it as written.
   const lm = text.match(/(?:^|[·|])[ \t]*\**OPTION SCORES\**[ \t]*:[ \t]*([^\n]+)/im);
   const line = (lm ? lm[1] : "").split(/PILLAR SCORE|CONFIDENCE|FINAL SCORE/i)[0];
   const scores = {};
   for (const id of optionIds) {
-    const m = line.match(new RegExp(`\\b${id}\\b\\s*[:=]?\\s*(\\d+(?:\\.\\d+)?)`));
+    const m = line.match(new RegExp(`\\b${id}\\b[\\])]?\\s*[:=]?\\s*(\\d+(?:\\.\\d+)?)`));
     if (m) scores[id] = Math.max(0, Math.min(10, Number(m[1])));
   }
   return scores;
