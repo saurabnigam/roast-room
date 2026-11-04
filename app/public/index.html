@@ -92,6 +92,13 @@
             <p class="wc-nudge" id="wcNudge" hidden>Nothing new for a while? Check Claude Code. It may be waiting for you to answer or approve something.</p>
           </div>
 
+          <div class="pausecard" id="pausecard" hidden role="group" aria-label="The council is waiting for you">
+            <p class="pc-head" id="pcHead"></p>
+            <p class="pc-sub" id="pcSub"></p>
+            <p class="pc-err" id="pcErr" role="alert" hidden></p>
+            <div class="row"><button class="pill" type="button" id="pcGo"></button><button class="ghost" type="button" id="pcStop">Stop</button></div>
+          </div>
+
           <div class="cruxes" id="cruxes" hidden></div>
           <div class="plate" id="plate" hidden></div>
         </div>
@@ -123,6 +130,31 @@
   <dialog id="cardDialog" class="card-dialog">
     <div id="cardBody"></div>
     <form method="dialog"><button class="ghost">Close</button></form>
+  </dialog>
+
+  <div class="yourturn" id="yourTurn" aria-live="polite"></div>
+
+  <dialog id="answerDialog" class="card-dialog answer-dialog" aria-labelledby="ansTitle">
+    <form id="answerForm" class="ans" novalidate autocomplete="off">
+      <div class="ans-head">
+        <div>
+          <div class="label" id="ansKicker"></div>
+          <h3 id="ansTitle"></h3>
+        </div>
+        <div class="ans-clock" id="ansClock" title="Time left to answer this round"></div>
+      </div>
+      <div class="ans-body" id="ansBody">
+        <div class="ans-alert" id="ansAlert" role="alert" hidden></div>
+        <div id="ansContext"></div>
+        <div id="ansPrompt"></div>
+        <div id="ansFields"></div>
+        <p class="ans-done" id="ansDone" hidden></p>
+      </div>
+      <div class="ans-foot">
+        <button class="ghost" type="button" id="ansClose">Close</button>
+        <button class="pill" type="submit" id="ansSend">Send my card</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog id="guideDialog" class="card-dialog">

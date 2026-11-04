@@ -6,11 +6,14 @@ export const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 // Two layouts: nested two folders deep in a larger workspace, or the standalone
 // student repo (app/ beside .claude/). The kit has .claude one level up.
 const KIT = fs.existsSync(path.join(APP_ROOT, "..", ".claude", "skills", "roast-room"));
-export const REPO_ROOT = KIT ? path.resolve(APP_ROOT, "..") : path.resolve(APP_ROOT, "..", "..");
+// ROAST_ROOT moves the whole tree (roster, agents, brains, sessions, .env) to another folder.
+// Tests point it at a disposable repo. Unset, nothing changes.
+const OVERRIDE = process.env.ROAST_ROOT ? path.resolve(process.env.ROAST_ROOT) : "";
+export const REPO_ROOT = OVERRIDE || (KIT ? path.resolve(APP_ROOT, "..") : path.resolve(APP_ROOT, "..", ".."));
 export const BRAINS_DIR = path.join(REPO_ROOT, ".claude", "skills", "roast-room", "brains");
 export const ROSTER = path.join(REPO_ROOT, ".claude", "skills", "roast-room", "roster.json");
 export const AGENTS_DIR = path.join(REPO_ROOT, ".claude", "agents");
-export const SESSIONS_DIR = KIT ? path.join(REPO_ROOT, "sessions") : path.join(REPO_ROOT, "projects", "founder-council", "sessions");
+export const SESSIONS_DIR = (OVERRIDE || KIT) ? path.join(REPO_ROOT, "sessions") : path.join(REPO_ROOT, "projects", "founder-council", "sessions");
 
 let cache = null;
 export function env(key) {

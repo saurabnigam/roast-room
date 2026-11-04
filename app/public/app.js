@@ -1,4 +1,5 @@
 import { downloadVerdictPdf } from "./pdf.js";
+import { badgeFor, seatDisclaimer, ROUND_FIELDS, CHOICES, MULTILINE } from "/runners.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -95,6 +96,16 @@ const ROUND_NAME = ["", "Opening", "Debate", "Vote"];
 const state = {
   seats: [], byKey: {}, board: [], table: [], session: null, options: [], weights: {}, active: [], round: 0,
   cards: { 1: {}, 2: {}, 3: {} }, replaying: false, verdict: null, links: [], geo: {}, setup: null, wait: null,
+  // who runs each seat: { key: { provider, model, transport } }
+  runners: {},
+  // A person is answering round `sealed`: other seats' cards for that round wait in `held` until it closes.
+  sealed: null, held: [], waitingSeats: [],
+  // seat_absent reasons by round, for the card dialog
+  absentLog: { 1: {}, 2: {}, 3: {} },
+  // the open privacy or quorum pause: { session, kind, busy } or null
+  pause: null, pauseHid: null,
+  // requests from GET /api/inbox, and what the room knows is over: "<session>" or "<session>#<round>"
+  inbox: [], shut: new Set(),
 };
 
 // ------------------------------------------------------------- boot
@@ -116,6 +127,9 @@ async function boot() {
   refreshUsage();
   setInterval(watchForLive, 2500);
   setInterval(tickWait, 1000);
+  setInterval(pollInbox, 2000);
+  setInterval(tickAnswer, 1000);
+  pollInbox();
 }
 
 // The roster (every seat, plus the default board) comes from the skill's roster.json.
@@ -176,11 +190,26 @@ function renderSeats(keys) {
   $("#plates").innerHTML = seats.map((s) => `
     <div class="nameplate" id="plate-${s.key}" data-seat="${s.key}">
       <b>${esc(s.short === "Gary V" ? "Gary V" : s.name)}</b>
+      <span class="prov"></span>
       <small>${esc(s.pillar)}</small>
       <div class="meta"><span class="pips" title="Weight on this decision"></span><span class="chip" hidden></span><span class="score" hidden></span></div>
     </div>`).join("");
+  updateBadges();
   layoutStage();
   startBlinking();
+}
+
+/** The runner for a seat. A seat the council did not describe runs as its roster entry says. */
+const runnerOf = (key) => state.runners[key] ?? (state.byKey[key]?.provider && state.byKey[key].provider !== "anthropic" ? { provider: state.byKey[key].provider } : undefined);
+
+/** Put "Claude Sonnet", "GPT via API", "Human" and so on on each nameplate. No runner reads "Claude". */
+function updateBadges() {
+  for (const k of state.table) {
+    const el = $(`#plate-${k} .prov`);
+    if (!el) continue;
+    el.textContent = badgeFor(runnerOf(k));
+    el.dataset.p = runnerOf(k)?.provider || "anthropic";
+  }
 }
 
 // The table is an ellipse seen from the front. Seats sit along its far edge: the
@@ -283,6 +312,22 @@ function bindUI() {
     $$(".speed button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
   }));
   $("#skipBtn").addEventListener("click", () => player.skip());
+  $("#pcGo").addEventListener("click", () => answerPause("continue"));
+  $("#pcStop").addEventListener("click", () => answerPause("stop"));
+  $("#yourTurn").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-key]");
+    const req = b && state.inbox.find((r) => reqKey(r) === b.dataset.key);
+    if (req) openAnswer(req);
+  });
+  $("#answerForm").addEventListener("submit", sendAnswer);
+  // Enter in a one-line field would submit the form, and a send is final (409 after). Textareas keep Enter;
+  // the Send button still submits.
+  $("#answerForm").addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.tagName === "INPUT") e.preventDefault(); });
+  $("#answerForm").addEventListener("input", onFormEdit);
+  $("#answerForm").addEventListener("change", onFormEdit);
+  $("#ansClose").addEventListener("click", () => $("#answerDialog").close());
+  $("#answerDialog").addEventListener("close", () => { saveDraft(); answer = null; });
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") pollInbox(); });
 }
 
 // ------------------------------------------------------------- the player
@@ -321,8 +366,12 @@ const player = {
 function reset() {
   state.es?.close();
   player.reset();
-  Object.assign(state, { session: null, options: [], weights: {}, active: [], round: 0, cards: { 1: {}, 2: {}, 3: {} }, replaying: false, verdict: null, links: [], speaking: null, setup: null, wait: null });
+  Object.assign(state, {
+    session: null, options: [], weights: {}, active: [], round: 0, cards: { 1: {}, 2: {}, 3: {} }, replaying: false, verdict: null, links: [], speaking: null, setup: null, wait: null,
+    runners: {}, sealed: null, held: [], waitingSeats: [], absentLog: { 1: {}, 2: {}, 3: {} }, pause: null, pauseHid: null, shut: new Set(),
+  });
   hideWait();
+  $("#pausecard").hidden = true;
   $("#stage").classList.remove("live");
   $("#topic").hidden = true;
   $("#composer").hidden = state.runner !== "api";
@@ -338,10 +387,13 @@ function reset() {
   $$(".vote").forEach((b) => b.remove());
   renderSeats(state.board);
   $$(".seat").forEach((el) => { el.classList.remove("absent", "speaking", "thinking", "addressed"); $(".bust", el).dataset.shape = "base"; });
-  $$(".nameplate").forEach((el) => { el.classList.remove("absent", "speaking"); $(".chip", el).hidden = true; $(".score", el).hidden = true; $(".pips", el).innerHTML = ""; });
+  $$(".seat").forEach((el) => el.classList.remove("absent-round"));
+  $$(".nameplate").forEach((el) => { el.classList.remove("absent", "speaking", "absent-round"); const chip = $(".chip", el); chip.hidden = true; chip.className = "chip"; delete chip.dataset.mark; $(".score", el).hidden = true; $(".pips", el).innerHTML = ""; });
+  updateBadges();
   $("#spot").classList.remove("on");
   $$(".stepper li").forEach((li) => li.classList.remove("active", "done"));
   drawLinks();
+  renderYourTurn();
 }
 
 function begin(id) {
@@ -363,10 +415,10 @@ function attach(id) {
   state.es = es;
   es.onmessage = (m) => {
     const ev = JSON.parse(m.data);
-    if (ev.type === "end") { es.close(); refreshUsage(); return; }
+    if (ev.type === "end") { es.close(); refreshUsage(); player.push(ev); return; } // the queue clears the seal, the pause and the buttons in order
     if (ev.type === "delta") return; // seats speak from their finished cards
     if (ev.type === "usage") return refreshUsage();
-    if (ev.type === "seat_error") return toast(`${state.byKey[ev.seat].short} hit an error: ${ev.error}`);
+    if (ev.type === "seat_error") return toast(`${state.byKey[ev.seat]?.short || ev.seat} hit an error: ${ev.error}`);
     player.push(ev);
   };
   es.onerror = () => { /* the browser retries; the server replays from the start */ };
@@ -399,14 +451,42 @@ async function handle(ev) {
       break;
     }
     case "setup": state.setup = ev; await onSetup(ev); await player.sleep(1800); break;
+    case "runners": state.runners = ev.runners || {}; updateBadges(); break;
     case "round_start": onRoundStart(ev.round); break;
     case "seat_start": $(`#seat-${ev.seat}`)?.classList.add("thinking"); break;
-    case "seat_done": await onSeatDone(ev); break;
-    case "round_done": state.wait = null; updateOptions(ev.scores); break;
+    case "seat_done":
+      // While a person answers this round, no one else's card is read out. It waits in state.held.
+      if (state.sealed !== null && ev.round === state.sealed) holdSeat(ev);
+      else await onSeatDone(ev);
+      break;
+    case "seat_absent": onSeatAbsent(ev); break;
+    case "waiting": await onWaiting(ev); break;
+    case "waiting_done": await closeRound(ev.round); break;
+    case "round_done": {
+      const epoch = player.epoch;
+      await closeRound(ev.round);
+      if (player.epoch !== epoch) break; // the room moved to another council meanwhile
+      state.wait = null; updateOptions(ev.scores); break;
+    }
     case "cruxes": await onCruxes(ev); break;
     case "draft": await onDraft(ev.draft); break;
-    case "verdict": state.wait = null; onVerdict(ev); break;
-    case "error": state.wait = null; toast(`The council stopped: ${ev.error}`); chairSays(`The council stopped: ${ev.error}`); break;
+    case "pause": showPause(ev); break;
+    case "resumed": hidePause(); break;
+    // finishSession returns early when the room is reset while it plays held cards. The verdict and the
+    // error then belong to the council the room left, so they must not show against the new one.
+    case "verdict": {
+      const epoch = player.epoch;
+      await finishSession();
+      if (player.epoch !== epoch) break;
+      state.wait = null; onVerdict(ev); break;
+    }
+    case "error": {
+      const epoch = player.epoch;
+      await finishSession();
+      if (player.epoch !== epoch) break;
+      state.wait = null; toast(`The council stopped: ${ev.error}`); chairSays(`The council stopped: ${ev.error}`); break;
+    }
+    case "end": await finishSession(); break;
   }
 }
 
@@ -418,6 +498,8 @@ async function onSetup(ev) {
   state.options = ev.options;
   state.weights = ev.weights;
   state.active = ev.seats;
+  state.runners = ev.runners || {};
+  updateBadges();
   $("#topic").hidden = false;
   $("#topicTitle").textContent = ev.title;
   typeIn($("#topicTitle"));
@@ -447,6 +529,7 @@ function updateOptions(scores) {
 
 function onRoundStart(round) {
   state.round = round;
+  $$(".seat.absent-round").forEach((el) => markAbsent(el.dataset.seat, false)); // absent for one round, not for the council
   state.links = [];
   drawLinks();
   $("#cruxes").hidden = true;
@@ -566,7 +649,8 @@ function startBlinking() {
 
 async function onSeatDone(ev) {
   const { round, seat, text, parsed, quotes } = ev;
-  state.cards[round][seat] = { text, parsed, quotes };
+  state.cards[round][seat] = { text, parsed, quotes, partial: ev.partial === true };
+  markAbsent(seat, false); // a seat that answers is not absent
   const s = state.byKey[seat];
   const top = topOption(parsed.optionScores);
   const line = lineFor(round, parsed);
@@ -584,24 +668,24 @@ async function onSeatDone(ev) {
     }
     sub = /^yes/i.test(parsed.moved) ? "Changed position" : "";
   } else {
-    const v = parsed.vote || "endorse";
-    tag = `Votes ${v}`;
-
+    tag = parsed.vote ? `Votes ${parsed.vote}` : "No vote"; // a missing vote is not an endorsement
   }
-  feedCard(round, seat, parsed);
+  feedCard(round, seat, parsed, ev.partial === true);
   await speak(seat, line || "I'll put it in my card.", { tag, target, sub });
 
   const pl = $(`#plate-${seat}`);
   const chip = $(".chip", pl);
   chip.hidden = round === 3; // the vote stamp says it
   chip.className = "chip";
+  delete chip.dataset.mark;
   if (round === 3) {
-    const v = parsed.vote || "endorse";
+    const v = parsed.vote || "no vote";
+    const vc = /^[a-z]+$/.test(v) ? v : "novote"; // "no vote" has a space, and a class name cannot
     chip.textContent = v;
-    chip.classList.add(v);
+    chip.classList.add(vc);
     $(`#seat-${seat} .vote`)?.remove();
     const stamp = document.createElement("div");
-    stamp.className = `vote ${v}`;
+    stamp.className = `vote ${vc}`;
     stamp.textContent = v.toUpperCase();
     $(`#seat-${seat}`).appendChild(stamp);
   } else chip.textContent = stanceWord(parsed.stance);
@@ -678,7 +762,7 @@ function feedPhase(label) {
   d.textContent = label.replace(/^The Chair is /, "Chair: ");
   feedAppend(d);
 }
-function feedCard(round, seat, parsed) {
+function feedCard(round, seat, parsed, partial = false) {
   const s = state.byKey[seat];
   const d = document.createElement("div");
   d.className = "feed-card";
@@ -686,8 +770,9 @@ function feedCard(round, seat, parsed) {
   d.dataset.round = round;
   const top = topOption(parsed.optionScores);
   const tgt = parsed.disagreeWith ? state.byKey[parsed.disagreeWith]?.short : "";
-  const what = round === 1 ? `${stanceWord(parsed.stance)}${top ? `, backs ${top.id}` : ""}` : round === 2 ? (tgt ? `vs ${tgt}` : "Debate") : `Votes ${parsed.vote || "endorse"}`;
-  d.innerHTML = `<img class="av" src="${portrait(seat)}" alt=""><div><div class="h">${esc(s.short)}<span class="r">${esc(what)}</span></div><p>${esc(lineFor(round, parsed, 105))}</p></div>`;
+  const what = round === 1 ? `${stanceWord(parsed.stance)}${top ? `, backs ${top.id}` : ""}` : round === 2 ? (tgt ? `vs ${tgt}` : "Debate") : (parsed.vote ? `Votes ${parsed.vote}` : "No vote");
+  const cut = partial ? `<span class="cut" title="This card hit the length limit and ended early.">cut off</span>` : "";
+  d.innerHTML = `<img class="av" src="${portrait(seat)}" alt=""><div><div class="h">${esc(s.short)}<span class="r">${esc(what)}</span>${cut}</div><p>${esc(lineFor(round, parsed, 105))}</p></div>`;
   feedAppend(d);
 }
 
@@ -696,11 +781,17 @@ function openCard(seat, round) {
   const rounds = [3, 2, 1].filter((r) => state.cards[r][seat]);
   const r = round || rounds[0];
   const c = state.cards[r]?.[seat];
+  // With no card to show, say why: sealed while a person answers, absent, or simply not yet.
+  const held = state.held.some((e) => e.seat === seat && (!round || e.round === round));
+  const goneRound = round || [3, 2, 1].find((x) => state.absentLog[x]?.[seat] !== undefined);
+  const empty = held ? `<p class="muted">${esc(s.short)} has answered. The card opens when the round closes.</p>`
+    : goneRound && state.absentLog[goneRound]?.[seat] !== undefined ? `<p class="muted">${esc(s.short)} did not answer Round ${goneRound} (${esc(state.absentLog[goneRound][seat])}).</p>`
+    : `<p class="muted">This seat has not spoken yet.</p>`;
   $("#cardBody").innerHTML = `
     <div class="card-head"><img src="${portrait(seat)}" alt=""><div><div class="label">${esc(s.pillar)}</div><h3>${esc(s.name)}</h3><p class="muted" style="margin:0">Owns the question: ${esc(s.question)}</p></div></div>
     ${rounds.length > 1 ? `<p style="margin:0 0 6px">${rounds.slice().reverse().map((x) => `<button class="ghost" data-r="${x}" style="margin-right:6px">${ROUND_NAME[x]}</button>`).join("")}</p>` : ""}
-    ${c ? `<pre>${esc(c.text)}</pre>${c.quotes.length ? `<ul class="qcheck">${c.quotes.map((q) => `<li class="${q.verified ? "" : "bad"}">"${esc(shorten(q.quote, 110))}" (${q.source}) ${q.verified ? "verified in the brain" : "not found in the brain"}</li>`).join("")}</ul>` : ""}` : `<p class="muted">This seat has not spoken yet.</p>`}
-    <p class="muted" style="font-size:12px">A simulated advisor built from ${esc(s.name)}'s public work. Not the person.</p>`;
+    ${c ? `<pre>${esc(c.text)}</pre>${c.partial ? `<p class="cutoff">Cut off: this card hit the length limit and ended early.</p>` : ""}${c.quotes.length ? `<ul class="qcheck">${c.quotes.map((q) => `<li class="${q.verified ? "" : "bad"}">"${esc(shorten(q.quote, 110))}" (${q.source}) ${q.verified ? "verified in the brain" : "not found in the brain"}</li>`).join("")}</ul>` : ""}` : empty}
+    <p class="muted" style="font-size:12px">${esc(seatDisclaimer(s, state.runners[seat]))}</p>`;
   $$("#cardBody [data-r]").forEach((b) => b.addEventListener("click", () => openCard(seat, Number(b.dataset.r))));
   const dlg = $("#cardDialog");
   if (!dlg.open) dlg.showModal();
@@ -710,6 +801,13 @@ function openCard(seat, round) {
 // the Chair should write display names; map any raw seat key just in case
 const seatKey = (x) => { const k = String(x).toLowerCase().replace(/\s+/g, ""); return state.byKey[k] ? k : state.seats.find((s) => s.short.toLowerCase() === String(x).toLowerCase() || s.name.toLowerCase() === String(x).toLowerCase())?.key; };
 const seatName = (x) => state.byKey[seatKey(x)]?.short || x;
+
+/** "7 amend" or "5 endorse, 1 dissent": only the votes that were cast, in the order of the vote round. */
+function voteLine(votes) {
+  const order = ["endorse", "amend", "dissent"];
+  const keys = [...order.filter((k) => votes[k]), ...Object.keys(votes).filter((k) => !order.includes(k) && votes[k])];
+  return keys.length ? keys.map((k) => `${votes[k]} ${k}`).join(", ") : "No votes cast";
+}
 
 function labelClass(l) { return /DON'T/.test(l) ? "dont" : /RESHAPE/.test(l) ? "reshape" : /WAIT/.test(l) ? "wait" : "go"; }
 
@@ -737,7 +835,7 @@ function onVerdict(ev) {
     <div class="v-grid">
       <div class="v-sec"><h3>Scores</h3><div class="v-opts">${state.options.map((o) => `
         <div class="opt ${o.id === v.recommended ? "lead" : ""}"><span class="id">${o.id}</span><span class="label">${esc(o.label)}</span><span class="val">${v.scores[o.id]?.score ?? "-"}</span><span class="bar"><i style="width:${(v.scores[o.id]?.score || 0) * 10}%"></i></span></div>`).join("")}</div>
-        <p class="v-meta">Confidence ${v.confidence ?? "-"}/10${v.votes ? ` · ${v.votes.endorse || 0} endorse, ${v.votes.amend || 0} amend, ${v.votes.dissent || 0} dissent` : ""}</p>
+        <p class="v-meta">Confidence ${v.confidence ?? "-"}/10${v.votes ? ` · ${esc(voteLine(v.votes))}` : ""}</p>
       </div>
       <div class="v-sec"><h3>Why</h3><ul class="v-why">${v.why.slice(0, 3).map((w) => { const k = seatKey(w.seat); return `<li>${k ? `<img class="av" src="${portrait(k)}" alt="">` : ""}<span>${short(w.point, 150)}</span></li>`; }).join("")}</ul></div>
       <div class="v-sec"><h3>Watch out</h3><div class="minority"><div class="who">${mk ? `<img class="av" src="${portrait(mk)}" alt="">` : ""}${esc(seatName(v.minority.seat))}</div><q>${short(v.minority.quote, 170)}</q></div></div>
@@ -750,7 +848,7 @@ function onVerdict(ev) {
         <div class="v-sec"><h3>Conditions</h3><ol>${v.conditions.map((c) => `<li>${esc(c)}</li>`).join("")}</ol></div>
         <div class="v-sec v-wide"><h3>Scorecard</h3>
           <table class="scorecard"><thead><tr><th>Seat</th><th>Weight</th>${state.options.map((o) => `<th>${o.id}</th>`).join("")}<th>Their line</th></tr></thead><tbody>
-          ${seats.map((x) => { const s = state.byKey[x.key]; return `<tr><td><span class="who"><img class="av" src="${portrait(x.key)}" alt="">${esc(s.short)}</span></td><td class="n">${x.weight}</td>${state.options.map((o) => `<td class="n">${x.optionScores?.[o.id] ?? "-"}</td>`).join("")}<td class="line">${short(x.oneLine, 150)}</td></tr>`; }).join("")}
+          ${seats.map((x) => { const s = state.byKey[x.key]; return `<tr${x.absent ? ' class="gone"' : ""}><td><span class="who"><img class="av" src="${portrait(x.key)}" alt="">${esc(s.short)}${x.absent ? '<span class="tag-absent">Absent</span>' : ""}</span></td><td class="n">${x.weight}</td>${state.options.map((o) => `<td class="n">${x.absent ? "-" : x.optionScores?.[o.id] ?? "-"}</td>`).join("")}<td class="line">${x.absent ? "" : short(x.oneLine, 150)}</td></tr>`; }).join("")}
           </tbody></table>
           <p class="muted" style="font-size:11.5px;margin-top:8px">Weighted by how much each pillar matters here. ${state.options.map((o) => `${o.id}: ${esc(v.scores[o.id]?.math || "")}`).join(" · ")}</p></div>
         <div class="v-sec"><h3>Cheapest test</h3><p>${esc(v.cheapest_test)}</p><h3>Revisit</h3><p>${esc(v.revisit)}</p></div>
@@ -760,6 +858,7 @@ function onVerdict(ev) {
     </details>
     <div class="v-foot"><span class="muted">${esc(v.disclaimer)}</span><button class="ghost" data-close>Back to the table</button></div>`;
   $("#verdictBody").innerHTML = html;
+  for (const x of seats) if (x.absent) markAbsent(x.key, true); // no answer in the last round: no score on the table
   const plate = $("#plate");
   plate.hidden = false;
   plate.innerHTML = `<div class="label">The council's verdict</div><span class="v-label ${labelClass(v.label)}">${esc(v.label)}</span><p>${esc(firstSentences(clean(v.call), 150))}</p><div class="row"><button type="button" id="plateOpen">Read the verdict</button><button type="button" data-pdf>Download PDF</button><button type="button" class="alt" id="plateReplay">Replay this council</button></div>`;
@@ -791,6 +890,9 @@ async function replay(id) {
     if (["delta", "usage", "seat_error", "end"].includes(ev.type)) continue;
     player.push(ev);
   }
+  // A saved council is over, so nothing in it can still be waiting: this clears a seal, a pause or a
+  // button that the saved events left open. A council still running keeps them.
+  if (j.status && j.status !== "running") player.push({ type: "end" });
 }
 
 // ------------------------------------------------------------- waiting on Claude Code
@@ -824,7 +926,7 @@ function hideWait() {
 function tickWait() {
   const w = state.wait;
   const idle = !player.busy && !player.q.length;
-  if (!w || !idle || state.replaying || !state.session || state.verdict) return hideWait();
+  if (!w || !idle || state.replaying || !state.session || state.verdict || state.pause) return hideWait();
   const card = $("#waitcard");
   if (card.hidden) {
     state.capWasShown = !$("#caption").hidden;
@@ -836,23 +938,28 @@ function tickWait() {
     card.hidden = false;
     state.museAt = 0;
   }
-  const [step, head, sub] = waitCopy(w.phase);
+  let [step, head, sub] = waitCopy(w.phase);
   const elapsed = Date.now() - w.at;
+  const round = Number((w.phase.match(/^round(\d)$/) || [])[1]) || 0;
+  // A person is answering this round: say who, instead of "the advisors are writing in Claude Code".
+  const people = round && state.sealed === round ? state.waitingSeats.map((x) => state.byKey[x.key]?.short).filter(Boolean) : [];
+  if (people.length) { head = `Waiting for ${joinList(people)} to answer.`; sub = "The other cards stay sealed until the round closes."; }
   $("#wcStep").textContent = step;
   $("#wcTime").textContent = clock(elapsed);
   $("#wcHead").textContent = head;
   $("#wcSub").textContent = sub;
-  $("#wcNudge").hidden = elapsed < 4 * 60 * 1000;
-  const round = Number((w.phase.match(/^round(\d)$/) || [])[1]) || 0;
+  $("#wcNudge").hidden = elapsed < 4 * 60 * 1000 || people.length > 0;
   const bar = $("#wcBar").parentElement;
   const muse = $("#wcMuse");
   if (round) {
     const seats = state.active.length ? state.active : state.table;
-    const done = seats.filter((k) => state.cards[round][k]).length;
+    const sealedKeys = new Set(state.held.filter((e) => e.round === round).map((e) => e.seat));
+    const answered = (k) => state.cards[round][k] || sealedKeys.has(k);
+    const done = seats.filter(answered).length;
     bar.classList.toggle("indeterminate", done === 0);
     $("#wcBar").style.width = done ? Math.round((done / seats.length) * 100) + "%" : "";
     // every few seconds, show what one of the still-thinking seats is weighing
-    const pending = seats.filter((k) => !state.cards[round][k]);
+    const pending = seats.filter((k) => !answered(k));
     if (pending.length && Date.now() - (state.museAt || 0) > 5200) {
       state.museAt = Date.now();
       state.museIdx = ((state.museIdx ?? -1) + 1) % pending.length;
@@ -876,6 +983,500 @@ function openGuide() {
   $("#guideBody").innerHTML = GUIDE;
   const d = $("#guideDialog");
   if (!d.open) d.showModal();
+}
+
+// ------------------------------------------------------------- people at the table
+// A seat can be a person on this Mac, or an AI the council could not reach. These handlers keep the
+// room honest about both: whose card is sealed, who did not answer, and what the council is waiting for.
+const joinList = (xs) => (xs.length < 3 ? xs.join(" and ") : `${xs.slice(0, -1).join(", ")}, and ${xs[xs.length - 1]}`);
+
+function feedNote(html) {
+  const f = document.createElement("div");
+  f.className = "feed-note";
+  f.innerHTML = html;
+  feedAppend(f);
+}
+
+// A nameplate chip can carry a mark ("Answered", "Absent"). A mark is removed only by clearMark, or
+// overwritten by the seat's own card, so it never outlives the state it describes.
+function setMark(key, mark, label) {
+  const chip = $(`#plate-${key} .chip`);
+  if (!chip) return;
+  chip.hidden = false;
+  chip.className = `chip ${mark}`;
+  chip.textContent = label;
+  chip.dataset.mark = mark;
+}
+function clearMark(key, mark) {
+  const chip = $(`#plate-${key} .chip`);
+  if (!chip || chip.dataset.mark !== mark) return;
+  delete chip.dataset.mark;
+  chip.hidden = true;
+  chip.className = "chip";
+  chip.textContent = "";
+}
+
+/** A seat that gave no answer this round: dim the seat and its nameplate, say "Absent", drop its score. */
+function markAbsent(key, on) {
+  $(`#seat-${key}`)?.classList.toggle("absent-round", on);
+  $(`#plate-${key}`)?.classList.toggle("absent-round", on);
+  if (on) {
+    setMark(key, "absent", "Absent");
+    const sc = $(`#plate-${key} .score`);
+    if (sc) sc.hidden = true;
+  } else clearMark(key, "absent");
+}
+
+function onSeatAbsent(ev) {
+  const s = state.byKey[ev.seat];
+  if (!s) return;
+  const reason = String(ev.reason ?? "no reason given");
+  (state.absentLog[ev.round] ||= {})[ev.seat] = reason;
+  $(`#seat-${ev.seat}`)?.classList.remove("thinking");
+  markAbsent(ev.seat, true);
+  feedNote(`<b>${esc(s.short)}</b> did not answer Round ${esc(ev.round)} (${esc(reason)})`);
+}
+
+// ---- sealed cards
+// While a person answers round N, no one else's round-N card is read out, so the person is not
+// swayed by what is on the screen. The cards wait in state.held and play, in order, when the round closes.
+async function onWaiting(ev) {
+  if (!Number.isInteger(ev.round)) return;
+  if (state.sealed !== null && state.sealed !== ev.round) await releaseHeld(state.sealed);
+  state.sealed = ev.round;
+  state.waitingSeats = Array.isArray(ev.seats) ? ev.seats : [];
+  state.shut.delete(`${state.session}#${ev.round}`);
+  renderYourTurn();
+  pollInbox(); // the request exists by now: show the button without waiting for the next tick
+}
+
+function holdSeat(ev) {
+  const s = state.byKey[ev.seat];
+  state.held.push(ev);
+  markAbsent(ev.seat, false);
+  $(`#seat-${ev.seat}`)?.classList.remove("thinking");
+  setMark(ev.seat, "sealed", "Answered");
+  if (s) feedNote(`<b>${esc(s.short)}</b> has answered. Cards open when the round closes.`);
+}
+
+/** Open the seal on one round and play its held cards in the order they came. */
+async function releaseHeld(round) {
+  if (state.sealed === round) { state.sealed = null; state.waitingSeats = []; }
+  const mine = state.held.filter((e) => e.round === round);
+  if (!mine.length) return;
+  state.held = state.held.filter((e) => e.round !== round);
+  const epoch = player.epoch;
+  for (const ev of mine) {
+    if (player.epoch !== epoch) return; // the room moved to another council meanwhile
+    await onSeatDone(ev);
+  }
+}
+
+/** waiting_done or round_done: the round is over. Its cards open and its Your turn button goes. */
+async function closeRound(round) {
+  const epoch = player.epoch;
+  await releaseHeld(round);
+  if (player.epoch !== epoch) return; // the room moved to another council meanwhile
+  state.shut.add(`${state.session}#${round}`);
+  renderYourTurn();
+}
+
+/** verdict, error or end: nothing in this council can still be waiting. */
+async function finishSession() {
+  const epoch = player.epoch;
+  for (const r of [...new Set(state.held.map((e) => e.round))].sort()) {
+    await releaseHeld(r);
+    if (player.epoch !== epoch) return;
+  }
+  state.sealed = null;
+  state.waitingSeats = [];
+  hidePause();
+  if (state.session) state.shut.add(state.session);
+  renderYourTurn();
+}
+
+// ---- pauses (the API runner stops and asks)
+function showPause(ev) {
+  hideWait();
+  const kind = ev.kind === "quorum" ? "quorum" : "privacy";
+  state.pause = { session: state.session, kind, busy: false };
+  if (!state.pauseHid) state.pauseHid = { cap: !$("#caption").hidden, cruxes: !$("#cruxes").hidden };
+  $("#caption").hidden = true;
+  $("#cruxes").hidden = true;
+  if (kind === "privacy") {
+    $("#pcHead").textContent = ev.recipients
+      ? `Before Round 1: these will receive the brief and later rounds: ${ev.recipients}.`
+      : "Before Round 1: seats outside Anthropic will receive the brief and later rounds.";
+    $("#pcSub").textContent = "Nothing has gone to them yet. Send it and start, or stop here.";
+    $("#pcGo").textContent = "Send and start";
+  } else {
+    const n = Number(ev.have);
+    const who = !Number.isFinite(n) ? "Too few seats" : n === 0 ? "No seats" : `Only ${n} seat${n === 1 ? "" : "s"}`;
+    $("#pcHead").textContent = `${who} answered Round ${ev.round}.`;
+    $("#pcSub").textContent = "Continue with the seats that answered, or stop the council here.";
+    $("#pcGo").textContent = "Continue";
+  }
+  $("#pcErr").hidden = true;
+  setPauseBusy(false);
+  $("#pausecard").hidden = false;
+}
+
+function setPauseBusy(busy) {
+  $("#pcGo").disabled = busy;
+  $("#pcStop").disabled = busy;
+}
+
+function hidePause() {
+  const card = $("#pausecard");
+  const was = !card.hidden;
+  card.hidden = true;
+  state.pause = null;
+  if (state.pauseHid && was) { // put back what the card covered
+    $("#caption").hidden = !state.pauseHid.cap;
+    $("#cruxes").hidden = !state.pauseHid.cruxes;
+  }
+  state.pauseHid = null;
+}
+
+async function answerPause(action) {
+  const p = state.pause;
+  if (!p || p.busy) return;
+  p.busy = true;
+  setPauseBusy(true);
+  $("#pcErr").hidden = true;
+  const fail = (msg) => {
+    if (state.pause !== p) return;
+    p.busy = false;
+    setPauseBusy(false);
+    $("#pcErr").textContent = msg;
+    $("#pcErr").hidden = false;
+  };
+  try {
+    const r = await fetch(`/api/council/${encodeURIComponent(p.session)}/resume`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action }) });
+    const j = await r.json().catch(() => ({}));
+    if (state.pause !== p) return; // the room moved on while the request was out
+    if (r.ok) { $("#pcSub").textContent = action === "stop" ? "Stopping the council." : "Sent. The council is carrying on."; return; } // the resumed event removes the card
+    if (r.status === 404) { toast(j.error || "Nothing is waiting for a decision."); hidePause(); return; } // the card was out of date
+    fail(j.error || "That did not go through. Try again.");
+  } catch {
+    fail("Could not reach the room. Try again.");
+  }
+}
+
+// ------------------------------------------------------------- your turn
+// GET /api/inbox lists the answers the room is waiting on. A person on this Mac answers in a form.
+const reqKey = (r) => `${r.session}|${r.seat}|${r.round}`;
+const validRequest = (r) => r && typeof r === "object" && typeof r.session === "string" && typeof r.seat === "string" && Number.isInteger(r.round) && r.round >= 1 && r.round <= 3;
+const answered = new Set(); // requests this page has sent, so a late poll cannot bring the button back
+const drafts = new Map(); // what was typed, by request, so closing the form loses nothing
+let inboxBusy = false;
+let answer = null; // the open form: { req, key, controls, busy, closed, dead }
+
+async function pollInbox() {
+  if (inboxBusy || document.visibilityState !== "visible") return;
+  inboxBusy = true;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 5000); // a request that hangs must not block the next one
+  try {
+    const r = await fetch("/api/inbox", { signal: ctl.signal, cache: "no-store" });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (!Array.isArray(j?.requests)) return;
+    state.inbox = j.requests.filter(validRequest);
+    renderYourTurn();
+    syncAnswer(true);
+  } catch {
+    // The room is busy or restarting. Keep the last list: not hearing back is not the same as nothing waiting.
+  } finally {
+    clearTimeout(timer);
+    inboxBusy = false;
+  }
+}
+
+/** Requests to show: not sent from this page, and not in a round or a council the room has seen end. */
+function visibleRequests() {
+  return state.inbox.filter((r) => !answered.has(reqKey(r)) && !state.shut.has(r.session) && !state.shut.has(`${r.session}#${r.round}`));
+}
+
+function renderYourTurn() {
+  const box = $("#yourTurn");
+  const want = visibleRequests();
+  const have = new Map($$("button[data-key]", box).map((b) => [b.dataset.key, b]));
+  for (const [k, b] of have) if (!want.some((r) => reqKey(r) === k)) b.remove();
+  for (const r of want) {
+    const k = reqKey(r);
+    let b = have.get(k);
+    if (!b) {
+      b = document.createElement("button");
+      b.setAttribute("type", "button");
+      b.className = "pill yt-btn";
+      b.dataset.key = k;
+      box.appendChild(b);
+    }
+    const label = `Your turn: ${r.short || r.name || r.seat}, Round ${r.round}`;
+    if (b.textContent !== label) b.textContent = label;
+  }
+  syncAnswer();
+}
+
+// ---- the form
+function h(tag, props = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k === "text") el.textContent = v;
+    else if (k === "dataset") Object.assign(el.dataset, v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid !== undefined && kid !== null && kid !== false) el.append(kid);
+  return el;
+}
+
+function fieldKind(name) {
+  if (name === "OPTION SCORES") return "scores";
+  if (Object.hasOwn(CHOICES, name)) return "choice";
+  if (name === "CONFIDENCE") return "confidence";
+  if (/ SCORE$/.test(name)) return "score";
+  return MULTILINE.includes(name) ? "textarea" : "text";
+}
+
+const toInt = (v) => (/^\d+$/.test(String(v).trim()) ? Number(String(v).trim()) : null);
+const isBlank = (v) => String(v ?? "").trim() === "";
+
+/** One field's raw input -> { value } to send, { skip } for an empty optional field, or { error }. The server checks again. */
+function compile(c, raw) {
+  const { name, kind, required } = c;
+  if (kind === "scores") {
+    const ids = c.options.map((o) => o.id);
+    if (!ids.length) return { value: {} }; // nothing to score here: the server explains
+    if (ids.every((id) => isBlank(raw[id]))) return required ? { error: `${name} is required.` } : { skip: true };
+    const value = {};
+    const problems = [];
+    for (const id of ids) {
+      if (isBlank(raw[id])) { problems.push(`needs a score for option ${id}`); continue; }
+      const n = toInt(raw[id]);
+      if (n === null || n > 10) problems.push(`option ${id} must be a whole number from 0 to 10`);
+      else value[id] = n;
+    }
+    return problems.length ? { error: `${name} ${problems.join("; ")}.` } : { value };
+  }
+  if (isBlank(raw)) return required ? { error: `${name} is required.` } : { skip: true };
+  if (kind === "choice") return { value: raw };
+  if (kind === "confidence") {
+    const n = toInt(raw);
+    return n !== null && n >= 1 && n <= 5 ? { value: n } : { error: `${name} must be a whole number from 1 to 5.` };
+  }
+  if (kind === "score") {
+    const n = toInt(raw);
+    return n !== null && n <= 10 ? { value: n } : { error: `${name} must be a whole number from 0 to 10.` };
+  }
+  return { value: String(raw).trim() };
+}
+
+function buildField(a, name, required) {
+  const kind = fieldKind(name);
+  const id = `ans-f${a.controls.size}`;
+  const err = h("div", { class: "ans-err", role: "alert", hidden: true });
+  const mark = h("span", { class: required ? "req" : "optional", text: required ? "Required" : "Optional" });
+  const c = { name, kind, required, options: a.req.options, err, els: [] };
+  let wrap;
+  if (kind === "scores") {
+    wrap = h("fieldset", { class: "ans-field", dataset: { field: name } }, h("legend", { class: "label" }, name, mark));
+    for (const o of c.options) {
+      const input = h("input", { type: "number", min: "0", max: "10", step: "1", inputmode: "numeric", name, "data-opt": o.id, "aria-label": `Score for option ${o.id}, 0 to 10` });
+      c.els.push(input);
+      wrap.append(h("label", { class: "ans-opt" }, h("span", { class: "id", text: String(o.id) }), h("span", { class: "lab", text: String(o.label ?? "") }), input));
+    }
+    if (!c.options.length) wrap.append(h("p", { class: "muted", text: "This request came with no options to score." }));
+    c.get = () => Object.fromEntries(c.els.map((el) => [el.dataset.opt, el.value]));
+    c.set = (v) => { for (const el of c.els) el.value = v?.[el.dataset.opt] ?? ""; };
+  } else {
+    let el;
+    if (kind === "choice" || kind === "confidence") {
+      const values = kind === "confidence" ? ["1", "2", "3", "4", "5"] : CHOICES[name];
+      const label = (v) => (kind === "confidence" && v === "1" ? "1 (low)" : kind === "confidence" && v === "5" ? "5 (high)" : v);
+      el = h("select", { id, name, "aria-required": required ? "true" : false }, h("option", { value: "", text: "Choose one" }), values.map((v) => h("option", { value: v, text: label(v) })));
+    } else if (kind === "score") {
+      el = h("input", { id, type: "number", min: "0", max: "10", step: "1", inputmode: "numeric", name, "aria-required": required ? "true" : false });
+    } else if (kind === "textarea") {
+      el = h("textarea", { id, name, rows: "3", maxlength: "2000", "aria-required": required ? "true" : false });
+    } else {
+      el = h("input", { id, type: "text", name, maxlength: "2000", "aria-required": required ? "true" : false });
+    }
+    c.els.push(el);
+    c.get = () => el.value;
+    c.set = (v) => { el.value = v ?? ""; };
+    wrap = h("div", { class: "ans-field", dataset: { field: name } }, h("label", { class: "label", for: id }, name, mark), el);
+  }
+  wrap.append(err);
+  c.wrap = wrap;
+  a.controls.set(name, c);
+  return wrap;
+}
+
+function openAnswer(req) {
+  saveDraft();
+  const key = reqKey(req);
+  const a = (answer = { req, key, controls: new Map(), busy: false, closed: false, dead: false });
+  const spec = { required: req.fields?.required ?? ROUND_FIELDS[req.round].required, optional: req.fields?.optional ?? ROUND_FIELDS[req.round].optional };
+  req.options = Array.isArray(req.options) ? req.options : [];
+  $("#ansKicker").textContent = `Round ${req.round}: ${ROUND_NAME[req.round]}`;
+  $("#ansTitle").textContent = `Your turn, ${req.name || req.short || req.seat}`;
+  $("#ansAlert").hidden = true;
+  $("#ansAlert").textContent = "";
+  $("#ansDone").hidden = true;
+  $("#ansDone").textContent = "";
+  for (const id of ["#ansContext", "#ansPrompt", "#ansFields"]) $(id).hidden = false;
+  $("#ansSend").hidden = false;
+  $("#ansSend").disabled = false;
+  $("#ansSend").textContent = "Send my card";
+  // Everything below comes from the server and goes in as text, never as HTML.
+  const context = (Array.isArray(req.context) ? req.context : []).filter((c) => c && typeof c.text === "string");
+  $("#ansContext").replaceChildren(...context.map((c, i) => h("details", { class: "ans-ctx", open: i === 0 }, h("summary", { text: String(c.name ?? "") }), h("pre", { text: c.text }))));
+  $("#ansPrompt").replaceChildren(...(req.prompt ? [h("p", { class: "ans-prompt", text: req.prompt })] : []));
+  $("#ansFields").replaceChildren(...[...spec.required.map((n) => buildField(a, n, true)), ...spec.optional.map((n) => buildField(a, n, false))]);
+  const draft = drafts.get(key);
+  if (draft) for (const [name, c] of a.controls) if (name in draft) c.set(draft[name]);
+  tickAnswer();
+  const dlg = $("#answerDialog");
+  if (!dlg.open) dlg.showModal();
+}
+
+function saveDraft() {
+  if (!answer || answer.dead) return;
+  drafts.set(answer.key, Object.fromEntries([...answer.controls].map(([name, c]) => [name, c.get()])));
+}
+
+// Typing in a field clears that field's error and keeps the draft.
+function onFormEdit(e) {
+  saveDraft();
+  const wrap = e.target?.closest?.(".ans-field");
+  const c = wrap && answer && answer.controls.get(wrap.dataset.field);
+  if (c) { c.err.hidden = true; c.err.textContent = ""; }
+}
+
+function showAlert(a, msg) {
+  if (answer !== a) { toast(msg); return; }
+  $("#ansAlert").replaceChildren(...[].concat(msg).map((m) => h("div", { text: String(m) })));
+  $("#ansAlert").hidden = false;
+}
+
+function clearErrors(a) {
+  for (const c of a.controls.values()) { c.err.hidden = true; c.err.textContent = ""; }
+  $("#ansAlert").hidden = true;
+  $("#ansAlert").textContent = "";
+}
+
+/** Put each error next to its field. An error names its field first ("CONFIDENCE is required."). Any other goes on top. */
+function showErrors(a, errors) {
+  clearErrors(a);
+  const names = [...a.controls.keys()];
+  const byField = new Map();
+  const top = [];
+  for (const e of errors) {
+    const name = names.filter((n) => e.startsWith(n)).sort((x, y) => y.length - x.length)[0];
+    if (name) byField.set(name, [...(byField.get(name) || []), e]);
+    else top.push(e);
+  }
+  for (const [name, list] of byField) {
+    const c = a.controls.get(name);
+    c.err.replaceChildren(...list.map((m) => h("div", { text: m })));
+    c.err.hidden = false;
+  }
+  if (top.length) showAlert(a, top);
+  const first = [...byField.keys()].map((n) => a.controls.get(n)).sort((x, y) => names.indexOf(x.name) - names.indexOf(y.name))[0];
+  if (first) { first.els[0]?.focus(); first.wrap.scrollIntoView?.({ block: "nearest" }); }
+}
+
+async function sendAnswer(e) {
+  e.preventDefault();
+  const a = answer;
+  if (!a || a.busy || a.closed) return;
+  const fields = {};
+  const errors = [];
+  for (const [name, c] of a.controls) {
+    const out = compile(c, c.get());
+    if (out.error) errors.push(out.error);
+    else if ("value" in out) fields[name] = out.value;
+  }
+  if (errors.length) return showErrors(a, errors);
+  clearErrors(a);
+  a.busy = true;
+  $("#ansSend").disabled = true;
+  $("#ansSend").textContent = "Sending...";
+  try {
+    const r = await fetch("/api/answer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ session: a.req.session, seat: a.req.seat, round: a.req.round, fields }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) return answerSent(a);
+    if (r.status === 400) return showErrors(a, Array.isArray(j.errors) && j.errors.length ? j.errors.map(String) : [String(j.error || "The room did not accept the answer.")]);
+    if (r.status === 404 || r.status === 409) return answerDead(a, j.error || "This request is closed.");
+    showAlert(a, j.error || "The room could not take the answer. Try again.");
+  } catch {
+    showAlert(a, "Could not reach the room. Check that it is still running, then send again.");
+  } finally {
+    a.busy = false;
+    if (answer === a && !a.closed) { $("#ansSend").disabled = false; $("#ansSend").textContent = "Send my card"; }
+  }
+}
+
+function retire(a) { // this request is over: forget the draft, and keep its button from coming back
+  a.closed = a.dead = true;
+  drafts.delete(a.key);
+  answered.add(a.key);
+}
+
+function answerSent(a) {
+  retire(a);
+  if (answer === a) {
+    for (const id of ["#ansContext", "#ansPrompt", "#ansFields", "#ansAlert", "#ansSend"]) $(id).hidden = true;
+    $("#ansDone").textContent = "Sent. The council has your card.";
+    $("#ansDone").hidden = false;
+  }
+  renderYourTurn();
+}
+
+function answerDead(a, msg) {
+  retire(a);
+  if (answer === a) $("#answerDialog").close();
+  toast(msg);
+  renderYourTurn();
+}
+
+/** The form stays on screen so nothing typed is lost, but it can no longer send. */
+function lockAnswer(a, msg) {
+  if (a.closed) return;
+  a.closed = true;
+  if (answer === a) { showAlert(a, msg); $("#ansSend").disabled = true; }
+}
+
+// The form cannot be answered once the room has seen its round end, or the server stops listing it.
+// A request can drop out of one listing while its file is being rewritten, so the form locks only
+// when two polls in a row leave it out.
+const CLOSED = "This round has closed. The council moved on without this answer.";
+function syncAnswer(polled = false) {
+  const a = answer;
+  if (!a || a.closed || a.busy) return;
+  if (state.shut.has(a.req.session) || state.shut.has(`${a.req.session}#${a.req.round}`)) return lockAnswer(a, CLOSED);
+  if (!polled) return;
+  if (state.inbox.some((r) => reqKey(r) === a.key)) { a.missed = 0; return; }
+  a.missed = (a.missed || 0) + 1;
+  if (a.missed >= 2) lockAnswer(a, CLOSED);
+}
+
+function tickAnswer() {
+  const a = answer;
+  if (!a || a.dead) return;
+  const left = Date.parse(a.req.deadline) - Date.now();
+  const clockEl = $("#ansClock");
+  if (Number.isNaN(left)) { clockEl.textContent = ""; return; }
+  if (left <= 0) {
+    clockEl.textContent = "Time is up";
+    lockAnswer(a, "The deadline for this round has passed. The council moved on without this answer.");
+    return;
+  }
+  clockEl.textContent = `Time left ${clock(left)}`;
+  clockEl.classList.toggle("low", left < 2 * 60 * 1000);
 }
 
 // ------------------------------------------------------------- PDF

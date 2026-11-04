@@ -1,8 +1,8 @@
-import { env } from "./env.mjs";
+import { env } from "../env.mjs";
+import { postJson, fetchOrThrow, sleep, excerpt, ProviderError } from "./http.mjs";
 
 const URL = "https://api.anthropic.com/v1/messages";
 const RETRY = new Set([429, 500, 502, 503, 529]);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function headers() {
   return {
@@ -22,16 +22,23 @@ function addUsage(u = {}) {
   usage.calls += 1;
 }
 
-/** Stream a message; calls onText(delta) as text arrives. Returns the full text. */
-export async function stream({ model, system, messages, maxTokens = 2000, onText = () => {} }) {
+/**
+ * Stream a message; calls onText(delta) as text arrives. Returns the full text.
+ * onStop(stopReason) is called with the API's own stop reason ("end_turn", "max_tokens", ...)
+ * when the stream reports one.
+ * `signal` (optional) is passed to fetch, so the caller can cut the call off, for example with
+ * AbortSignal.timeout(ms). An abort rejects with the signal's own reason.
+ */
+export async function stream({ model, system, messages, maxTokens = 2000, onText = () => {}, onStop = () => {}, signal }) {
   for (let attempt = 0; attempt < 6; attempt++) {
-    const res = await fetch(URL, {
+    const res = await fetchOrThrow(URL, {
       method: "POST",
       headers: headers(),
       body: JSON.stringify({ model, system, messages, max_tokens: maxTokens, stream: true }),
-    });
-    if (RETRY.has(res.status)) { await sleep(Math.min(30000, 2000 * 2 ** attempt)); continue; }
-    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      signal,
+    }, "anthropic");
+    if (RETRY.has(res.status)) { await sleep(Math.min(30000, 2000 * 2 ** attempt), signal); continue; }
+    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${excerpt(await res.text())}`);
     let text = "";
     let buf = "";
     const dec = new TextDecoder();
@@ -52,8 +59,9 @@ export async function stream({ model, system, messages, maxTokens = 2000, onText
           Object.assign(finalUsage, ev.message?.usage || {});
         } else if (ev.type === "message_delta") {
           Object.assign(finalUsage, ev.usage || {});
+          if (ev.delta?.stop_reason) onStop(ev.delta.stop_reason);
         } else if (ev.type === "error") {
-          throw new Error(`Anthropic stream error: ${JSON.stringify(ev.error).slice(0, 300)}`);
+          throw new Error(`Anthropic stream error: ${excerpt(JSON.stringify(ev.error))}`);
         }
       }
     }
@@ -66,7 +74,7 @@ export async function stream({ model, system, messages, maxTokens = 2000, onText
 /** One call with structured JSON output matching `schema`. */
 export async function json({ model, system, prompt, schema, maxTokens = 4000 }) {
   for (let attempt = 0; attempt < 6; attempt++) {
-    const res = await fetch(URL, {
+    const res = await fetchOrThrow(URL, {
       method: "POST",
       headers: headers(),
       body: JSON.stringify({
@@ -74,15 +82,46 @@ export async function json({ model, system, prompt, schema, maxTokens = 4000 }) 
         output_config: { format: { type: "json_schema", schema } },
         messages: [{ role: "user", content: prompt }],
       }),
-    });
+    }, "anthropic");
     if (RETRY.has(res.status)) { await sleep(Math.min(30000, 2000 * 2 ** attempt)); continue; }
-    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${excerpt(await res.text())}`);
     const j = await res.json();
     addUsage(j.usage);
     if (j.stop_reason === "max_tokens") throw new Error("Chair output hit max_tokens");
     return JSON.parse(j.content.map((b) => b.text || "").join(""));
   }
   throw new Error("Anthropic API kept refusing after retries");
+}
+
+/**
+ * One non-streaming call that returns a seat's card as text, in the same shape as the other
+ * providers: { text, usage: { input, output, cacheRead }, stopReason: "end" | "max_tokens" }.
+ * A string `system` is sent as one cached block. A block array is sent as is.
+ * The call is added to the same `usage` tally that /api/usage returns. Retries come from postJson.
+ */
+export async function complete({ model, system, user, maxTokens, signal }) {
+  const blocks = typeof system === "string"
+    ? (system ? [{ type: "text", text: system, cache_control: { type: "ephemeral" } }] : undefined)
+    : system;
+  const j = await postJson(URL, {
+    provider: "anthropic",
+    headers: headers(),
+    body: { model, system: blocks, max_tokens: maxTokens, messages: [{ role: "user", content: user }] },
+    signal,
+  });
+  // Tokens were spent even if the reply turns out to be empty, so count them first.
+  addUsage(j?.usage ?? undefined);
+  const text = (Array.isArray(j?.content) ? j.content : [])
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("");
+  if (!text.trim()) throw new ProviderError("empty reply", { provider: "anthropic" });
+  const u = j.usage ?? {};
+  return {
+    text,
+    usage: { input: u.input_tokens || 0, output: u.output_tokens || 0, cacheRead: u.cache_read_input_tokens || 0 },
+    stopReason: j.stop_reason === "max_tokens" ? "max_tokens" : "end",
+  };
 }
 
 // JSON schema helpers

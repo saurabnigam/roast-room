@@ -24,6 +24,7 @@ Read before the first run: `references/brain-spec.md` (the brain layout and its 
 - **Public figures with a real body of public work**: essays, letters, books as they teach them in talks, long interviews where they are the main speaker, keynotes, their own channel or podcast. Living or historical.
 - **The user, or someone who gave consent**: built from material the user provides (their posts, transcripts, notes). Use `--add` in step 3.
 - **Not**: fictional characters, private people without their consent, or anyone whose public work is too thin. Under about 15 usable sources or 60,000 words, say so and offer `--quick` with a warning, or a different person.
+- **A real person who will answer live on this Mac** (a cofounder, a partner): not built here. Skip to the `--human` command in Step 7 and run nothing else. Never search the web for them.
 
 The seat is a simulation, not the person. The agent says so if asked, and only quotes what is in its brain.
 
@@ -118,12 +119,18 @@ Write `.claude/agents/council-<key>.md` from `references/agent-template.md`. Fil
 ## Step 7: Register the seat
 
 ```bash
-node .claude/skills/newroaster/scripts/add_seat.mjs --key <key> --name "<Full Name>" --short "<Short>" --slug <slug> --pillar "<pillar>" --question "<question>" --dimension "<dimension>" [--default] [--swap <key>]
+node .claude/skills/newroaster/scripts/add_seat.mjs --key <key> --name "<Full Name>" --short "<Short>" --slug <slug> --pillar "<pillar>" --question "<question>" --dimension "<dimension>" [--default] [--swap <key>] [--provider anthropic|openai|google] [--model <id>] [--cli-model <name>]
 ```
 
-It refuses if the agent file or a brain file is missing. `--default` adds the seat to the default board; `--swap <key>` takes another seat off it in the same move. Then:
+It refuses if the agent file or a brain file is missing. `--default` adds the seat to the default board; `--swap <key>` takes another seat off it in the same move. A new advisor runs on Claude. Pass `--provider openai` or `--provider google` only if the user asked for the seat to run there. `--model` is the provider's API id (for example `gpt-6.1-sol`) and `--cli-model` is the name the Codex or agy tool takes; each is written only when you pass it. Changing a seat's provider drops its stored `model` and `cli_model` unless you pass new ones. Then:
 
 - Add one or two "natural tension" lines for the new seat to `.claude/skills/roast-room/references/seats.md` (who they will clash with, and over what).
+
+A real person on the board needs none of the build steps: no research, no brain, no agent file, no portrait, no test seat. Add them with `--human` (initials and colour are picked for you), and skip the tension lines:
+
+```bash
+node .claude/skills/newroaster/scripts/add_seat.mjs --human --key <key> --name "<Full Name>" --short "<Short>" --pillar "<pillar>" --question "<question>" [--dimension "<dimension>"] [--default] [--swap <key>]
+```
 
 ## Step 8: Portrait
 

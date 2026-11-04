@@ -193,7 +193,8 @@ export async function downloadVerdictPdf({ setup, verdict: ev, byKey, id }) {
       font(10, "semibold", C.ink); doc.text(info.name || s.key, x, y + 13); x += cols[0].w;
       font(10, "normal", C.soft); doc.text(String(s.weight ?? "-"), x + cols[1].w / 2, y + 13, { align: "center" }); x += cols[1].w;
       for (const o of options) { font(10, "semibold", C.ink); doc.text(String(s.optionScores?.[o.id] ?? "-"), x + 20, y + 13, { align: "center" }); x += 40; }
-      if (showVote) { font(9.5, "normal", C.soft); doc.text(String(s.stance || "endorse").replace(/^./, (c) => c.toUpperCase()), x, y + 13); }
+      // A seat that did not answer the last round is "Absent". A seat with no vote on record is "No vote", never "Endorse".
+      if (showVote) { font(9.5, "normal", C.soft); doc.text(s.absent ? "Absent" : String(s.stance || "no vote").replace(/^./, (c) => c.toUpperCase()), x, y + 13); }
       y += 20; doc.setDrawColor(...C.rule); doc.line(M, y, W - M, y); y += 2;
     }
   }

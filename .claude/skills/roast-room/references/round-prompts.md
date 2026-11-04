@@ -4,7 +4,27 @@ Paste these into each seat's Agent call. Replace the bracketed parts. Seats read
 
 Agent type: `council-<seat>`. If that type is not registered in this session (agent files load at session start), spawn `general-purpose` and put these lines first: `Read .claude/agents/council-<seat>.md and follow it as your instructions for this whole task. Only read files; do not write anything.`
 
+The Agent call's `model` parameter is the seat's `agentModel` in `runners` in `council.json`. Leave `model` out when it is null. SKILL.md, "Dispatch a round", has the detail.
+
 Paths in prompts are relative to the repo root; give the absolute repo root once at the top of each prompt.
+
+**Seats on OpenAI or Google.** They get the same template, filled in the same way, through `--prompt-file` (a file at `sessions/<id>/prompts/<key>-r<N>.md`). A seat on another provider has no file tools, so remove the lines that tell it to read files:
+
+- the "Repo root: ..." sentence,
+- the "Read your brain's ..." sentence (in Round 3, "read only your _hot.md if you need it"),
+- the "Read the brief: ..." line in Round 1, and the "Read: ..." line in Rounds 2 and 3.
+
+Keep the rest, including "You hold the [SEAT] seat ([pillar])." `run_seat.mjs` attaches what was removed: the seat's agent file and brain in the system text, then these session files after the prompt, each under its own header. It also ends the message with a line asking for the card only, so do not add one.
+
+| Round | Attached after the prompt |
+|---|---|
+| 1 | `brief.md` |
+| 2 | `brief.md`, `round-1.md`, `cruxes.json` |
+| 3 | `brief.md`, the seat's own Round 2 card, `draft-resolution.md` |
+
+In Round 2, keep the "THE CRUXES THE CHAIR SEES" block. `cruxes.json` is attached too, but the block tells this seat which argument it must answer.
+
+**People.** A person gets the task, not the card template, because the room's form has the fields. Their prompt file is `sessions/<id>/prompts/people-r<N>.md`: the round title line and the task in a line or two. The form shows the session files for that round, as in the table above.
 
 **Options.** When the brief lists options (A, B, C, including "don't do it"), every card scores every option. When it is a single yes or no decision, the options are "do it as proposed" and "don't".
 
@@ -114,3 +134,5 @@ THE QUESTION
 
 Answer in your seat's voice, first person, under 500 words: your call, your reasoning with named frameworks and source ids, what you would do this week, and the question you would ask back. Do not narrate the expert in the third person. End with "Sources:" and the source ids you used.
 ```
+
+For a seat on OpenAI or Google, remove the "Repo root: ..." and "Read your brain's ..." sentences and write the rest to a temporary file outside `sessions/`. `run_seat.mjs --consult` loads the seat's brain, attaches no session files and does not add the card-only line. A person cannot be consulted, so there is no prompt for one.
